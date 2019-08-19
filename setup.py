@@ -99,7 +99,6 @@ setup(
         'cffi',
     ],
     install_requires=[
-        'chainmap >= 1.0.3; python_version == "2.7"',
         'cffi',
         'perfmetrics',
         'zope.interface',

@@ -25,7 +25,6 @@ import weakref
 
 from zope.interface import implementer
 
-from relstorage._compat import ChainMap
 from relstorage._compat import iterkeys
 from relstorage._compat import OID_OBJECT_MAP_TYPE as OidOMap
 from relstorage._compat import OID_TID_MAP_TYPE as OidTMap
@@ -39,6 +38,17 @@ from .interfaces import CacheConsistencyError
 from ._util import InvalidationMixin
 
 logger = __import__('logging').getLogger(__name__)
+
+###
+# Notes on in-process concurrency:
+#
+# Where possible, we rely on atomic primitive operations of fundamental types.
+# For example, we rely on ``dict[key] = value`` being atomic.
+# On CPython we use BTrees which are implemented in C and don't release the GIL
+# because they're always resident, so this holds true. On PyPy we use
+# native dicts and this also holds true. On CPython if we used PURE_PYTHON
+# BTrees, this would *not* hold true, so we also use dicts.
+###
 
 class _TransactionRangeObjectIndex(OidTMap):
     """
@@ -58,6 +68,11 @@ class _TransactionRangeObjectIndex(OidTMap):
     guarantee that it is complete.
     """
 
+    __slots__ = (
+        'highest_visible_tid',
+        'complete_since_tid',
+    )
+
     def __init__(self, highest_visible_tid, complete_since_tid, data):
         assert complete_since_tid is None or highest_visible_tid >= complete_since_tid
         self.highest_visible_tid = highest_visible_tid
@@ -67,21 +82,65 @@ class _TransactionRangeObjectIndex(OidTMap):
 
         if self:
             # Verify the data matches what they told us.
-            assert self.maxValue() <= highest_visible_tid
-            assert self.minValue() > complete_since_tid
+            # If we were constructed with data, we must be complete.
+            # Otherwise we get built up bit by bit.
+            assert self.complete_since_tid
+            self.verify()
+
+    def verify(self, initial=True):
+        # Check that our constraints are met
+        if not self or not __debug__:
+            return
+
+        mxv = self.maxValue()
+        mnv = self.minValue()
+        assert mxv <= self.highest_visible_tid, (mxv, self.highest_visible_tid)
+        assert mnv > 0, mnv
+        if initial:
+            # This is only true at startup. Over time we can add older entries.
+            assert self.complete_since_tid is None or mnv > self.complete_since_tid, (
+                mnv, self.complete_since_tid)
+
+    def complete_to(self, newer_bucket):
+        """
+        Given an incomplete bucket (this object) and a complete bucket for the
+        same or a later TID, merge this one to hold the same data and be complete
+        for the same transaction range.
+        """
+        assert not self.complete_since_tid
+        assert newer_bucket.complete_since_tid
+        assert newer_bucket.highest_visible_tid >= self.highest_visible_tid
+        self.update(newer_bucket)
+        self.highest_visible_tid = newer_bucket.highest_visible_tid
+        self.complete_since_tid = newer_bucket.complete_since_tid
+
+    def merge_same_tid(self, bucket):
+        """
+        Given an incoming complete bucket for the same highest tid as this bucket,
+        merge the two into this object.
+        """
+        assert bucket.highest_visible_tid == self.highest_visible_tid
+        self.update(bucket)
+        if bucket.complete_since_tid < self.complete_since_tid:
+            self.complete_since_tid = bucket.complete_since_tid
 
     # These raise ValueError if the map is empty
     if not hasattr(OidTMap, 'maxKey'):
         maxKey = lambda self: max(iterkeys(self))
 
     if hasattr(OidTMap, 'itervalues'): # BTrees, or Python 2 dict
-        maxValue = lambda self: max(self.itervalues())
-        minValue = lambda self: min(self.itervalues())
+        def maxValue(self):
+            return max(self.itervalues())
+        def minValue(self):
+            return min(self.itervalues())
     else:
-        maxValue = lambda self: max(self.values())
-        minValue = lambda self: min(self.values())
+        def maxValue(self):
+            return max(self.values())
+        def minValue(self):
+            return min(self.values())
 
-class _ObjectIndex(ChainMap):
+
+class _ObjectIndex(object):
     """
     Collectively holds all the object index visible to transactions <=
     ``highest_visible_tid``.
@@ -93,14 +152,24 @@ class _ObjectIndex(ChainMap):
     ``maximum_highest_visible_tid``. The ``highest_visible_tid`` of
     the final map defines our ``minimum_highest_visible_tid``.
 
+    The following describes the general evolution of this index and
+    its MVCC strategy. Some of this is implemented here, but much of
+    it is implemented in the :class:`MVCCDatabaseCoordinator`.
+
+    .. rubric:: Initial State
+
     In the beginning, the frontmost map will be empty and incomplete;
     it will have a ``highest_visible_tid`` but no
-    ``complete_since_tid``.
+    ``complete_since_tid``. (Alternately, if we restored from cache,
+    we may have data, but we are definitely still incomplete.) We may
+    load new object indices into this map, but only if they're less
+    than what our ``highest_visible_tid`` is (this is just a special
+    version of the general rule for updates laid out below).
 
     When a new poll takes place and produces a new change list, in the
-    form of a :class:`_TransactionRangeObjectIndex` that is added to
-    the front of a new instance of this object. This map does have a
-    ``complete_since_tid.``
+    form of a :class:`_TransactionRangeObjectIndex`, it is merged with
+    the previous map and replaced into this object. This map does have
+    a ``complete_since_tid.``
 
     After this first map is added, moving forward there should be no
     gaps in ``complete_since_tid`` coverage. There may be overlaps,
@@ -109,7 +178,7 @@ class _ObjectIndex(ChainMap):
     ``complete_since_tid`` in the second-to-last map.
 
     If the front of this instance already has data matching that same
-    ``highest_visible_tid``, the two maps are merged together,
+    ``highest_visible_tid``, the two maps are merged together
     preserving the lowest ``complete_since_tid`` value. In this case,
     a new instance is *not* returned; the same instance is returned so
     that this map can be shared.
@@ -117,13 +186,15 @@ class _ObjectIndex(ChainMap):
     If the front of this instance has a ``highest_visible_tid`` *less*
     than the new polled tid (that is, there's a new TID in the
     database) all data in the new map with a TID less than the current
-    ``highest_visible_tid`` can be discarded. In fact, we could limit
-    the poll to just that range (use ``highest_visible_tid`` as our
-    ``prev_polled_tid`` parameter), if we're willing to walk through
-    the current map and find all objects whose TID is greater than
-    what we would have used for ``prev_polled_tid`` (assuming it's >=
-    the current ``complete_since_tid`` value) --- but it's probably
-    better to just let the database do that.
+    ``highest_visible_tid`` could be discarded (but since we walk the
+    maps from front to back to find entries, the more data up front
+    the better). In fact, we could limit the poll to just that range
+    (use ``highest_visible_tid`` as our ``prev_polled_tid``
+    parameter), if we're willing to walk through the current map and
+    find all objects whose TID is greater than what we would have used
+    for ``prev_polled_tid`` (assuming it's >= the current
+    ``complete_since_tid`` value) --- but it's probably better to just
+    let the database do that.
 
     On the chance that the value we wish to poll from
     (``prev_polled_tid``) is <= our current ``complete_since_tid``,
@@ -143,7 +214,10 @@ class _ObjectIndex(ChainMap):
     (which also corresponds to the last reference to that
     ``TransactionRangeObjectIndex`` going away), that map is removed
     from the list (where it was the end), and any unique data in it is
-    added to the map at the new back of the list.
+    added to the map at the new back of the list. (The object that was
+    removed is *cleared* and marked as *inactive*: other transactions
+    will still have that same object on their list, but they shouldn't
+    use it anymore to store new index entries.)
 
     This last map will keep growing. We shrink it in two ways:
 
@@ -160,19 +234,138 @@ class _ObjectIndex(ChainMap):
           this special key. Even though the index data is not
           complete, this "frozen" object can still be found.
 
-          TODO: Maybe we actually want to use the new ``complete_since_tid`` value?
+    When merging this last map, we have an excellent time to purge
+    entries from the cache: Any OIDs stored in the last map who have
+    entries in other maps has their stored OID/TID from the last map
+    removed. These have changed, and by definition their old state is
+    not visible to any other connection.
 
-          TODO: The merging and recaching might be expensive? Perhaps we want to defer
-          it until some threshold is reached?
+    TODO: Maybe we actually want to use the new ``complete_since_tid``
+    value?
+
+    TODO: The merging and recaching might be expensive? Perhaps we
+    want to defer it until some threshold is reached?
     """
 
-    # Things to override:
+    __slots__ = (
+        'maps',
+    )
 
-    # __len__ and __iter__ are both based on set().uniuon(); if we're BTree based, we can
-    # do much better. (__iter__ is set().union() based in the backport; it uses a similar
-    # but different technique of building an entire new dict starting from the reverse list
-    # of maps
-    # and iterating that in 3.7)
+    def __init__(self, highest_visible_tid, complete_since_tid=None, data=()):
+        """
+        An instance is created with the first poll, giving us our
+        initial TID. It may optionally have data retrieved from
+        previously saving the map.
+        """
+        initial_bucket = _TransactionRangeObjectIndex(highest_visible_tid, complete_since_tid, ())
+        initial_bucket.update(data)
+        initial_bucket.verify(initial=False)
+        # Maps are read from 0...N, so newest bucket must be first.
+        self.maps = [initial_bucket]
+
+    def __getitem__(self, oid):
+        for mapping in self.maps:
+            try:
+                # TODO: Microbenchmark this. Which is faster,
+                # try/catch or .get()?
+                return mapping[oid]
+            except KeyError:
+                pass
+        # No data. Could it be frozen? We'll let the caller decide.
+        return None
+
+    def __contains__(self, oid):
+        return any(oid in m for m in self.maps)
+
+    def __setitem__(self, oid, tid):
+        # Silently discard things that are too new.
+        # Something like loadSerial for conflict resolution might do this;
+        # we'll see the object from the future when we poll for changes.
+        for mapping in reversed(self.maps):
+            if tid <= mapping.highest_visible_tid:
+                assert mapping.complete_since_tid is None or tid <= mapping.complete_since_tid
+                mapping[oid] = tid
+                break
+            # TODO: Do we want to store it everywhere possible for speed,
+            # at the cost of memory?
+
+    @property
+    def highest_visible_tid(self):
+        return self.maps[0].highest_visible_tid
+
+    maximum_highest_visible_tid = highest_visible_tid
+
+    @property
+    def minimum_highest_visible_tid(self):
+        return self.maps[-1].highest_visible_tid
+
+    @property
+    def complete_since_tid(self):
+        return self.maps[-1].complete_since_tid
+
+    def verify(self):
+        # Each component has values in range.
+        for ix in self.maps:
+            ix.verify(initial=False)
+        # No gaps in completion
+        map_iter = iter(self.maps)
+        newest_map = next(map_iter)
+        for mapping in map_iter:
+            assert newest_map.complete_since_tid <= mapping.highest_visible_tid
+            newest_map = mapping
+
+    def with_polled_changes(self, highest_visible_tid, complete_since_tid, changes):
+        # Never call this when the poller has specifically said
+        # that there are no changes; either the very first poll, or
+        # we went backwards due to reverting to a stale state. That's
+        # handled at a higher layer.
+        assert changes is not None
+        assert highest_visible_tid >= self.highest_visible_tid
+        assert complete_since_tid is not None
+
+        # First, create the transaction map.
+        assert highest_visible_tid and complete_since_tid
+        incoming_bucket = _TransactionRangeObjectIndex(highest_visible_tid,
+                                                       complete_since_tid,
+                                                       changes)
+        newest_bucket = self.maps[0]
+        oldest_bucket = self.maps[-1]
+
+        # Was this our first poll?
+        if newest_bucket is oldest_bucket and oldest_bucket.complete_since_tid is None:
+            # Merge the two together and replace ourself.
+            assert highest_visible_tid >= oldest_bucket.highest_visible_tid
+            # Overwrite the incomplete data with the new data, which is complete
+            # back to a point. The make the incomplete data become the complete data
+            oldest_bucket.complete_to(incoming_bucket)
+            return self
+
+        # Special cases:
+        #
+        # - len(new_bucket) == 0: No changes. Therefore, if this was
+        #   not our first poll, it must have returned the exact same
+        #   highest_visible_tid as our current highest visible tid. We
+        #   just need to set our frontmost map's
+        #   ``complete_since_tid`` to the lowest of the two values.
+        #   This is just a degenerate case of polling to a matching highest_visible_tid.
+
+        # We can't get a higher transaction id unless something changed.
+        # put the other way, if nothing changed, it must be for our existing tid.
+        assert incoming_bucket or (
+            not incoming_bucket and highest_visible_tid == newest_bucket.highest_visible_tid
+        )
+
+        if highest_visible_tid == newest_bucket.highest_visible_tid:
+            newest_bucket.merge_same_tid(incoming_bucket)
+            return self
+
+        # all that's left is to put the new bucket on front of a new object.
+        other = _ObjectIndex.__new__(_ObjectIndex)
+        other.maps = [incoming_bucket]
+        other.maps.extend(self.maps)
+        other.verify() # XXX: Remove before release.
+        return other
+
 
 @implementer(IStorageCacheMVCCDatabaseCoordinator)
 class MVCCDatabaseCoordinator(InvalidationMixin):

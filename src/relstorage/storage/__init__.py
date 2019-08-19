@@ -31,6 +31,8 @@ from ZODB import ConflictResolution
 from ZODB.mvccadapter import HistoricalStorageAdapter
 
 from ZODB.POSException import ReadConflictError
+from ZODB.POSException import ReadOnlyError
+from ZODB.POSException import ReadOnlyHistoryError
 
 from ZODB.utils import z64
 from zope import interface
@@ -72,6 +74,7 @@ from .tpc.begin import HistoryPreserving
 from .tpc.restore import Restore
 
 from .util import copy_storage_methods
+from .util import make_cannot_write
 from .interfaces import StorageDisconnectedDuringCommit
 
 __all__ = [
@@ -102,6 +105,7 @@ class RelStorage(LegacyMethodsMixin,
     _adapter = None
     _options = None
     _is_read_only = False
+    _read_only_error = ReadOnlyError
     # _ltid is the ID of the last transaction committed by this instance.
     _ltid = z64
 
@@ -131,8 +135,8 @@ class RelStorage(LegacyMethodsMixin,
     # to the same database.
     _instances = ()
 
-    _load_connection = None
-    _store_connection = None
+    _load_connection = ClosedConnection()
+    _store_connection = ClosedConnection()
     _tpc_begin_factory = None
 
     _oids = ReadOnlyOIDs()
@@ -285,6 +289,9 @@ class RelStorage(LegacyMethodsMixin,
         other = type(self)(adapter=adapter, name=self.__name__,
                            create=False, options=options, cache=cache,
                            blobhelper=blobhelper)
+        if before:
+            other._read_only_error = ReadOnlyHistoryError
+            other.tpc_begin = make_cannot_write(other, other.tpc_begin)
         # NOTE: We're depending on the GIL (or list implementation)
         # for thread safety here.
         self._instances.append(weakref.ref(other, self._instances.remove))

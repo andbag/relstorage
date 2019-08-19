@@ -18,7 +18,6 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import functools
 import itertools
 import sys
 import time
@@ -37,6 +36,8 @@ from ZODB.utils import u64
 from ZODB.loglevels import TRACE
 
 from relstorage._compat import MAC
+from relstorage._compat import wraps
+from relstorage._compat import update_wrapper
 
 logger = __import__('logging').getLogger(__name__)
 perf_logger = logger.getChild('timing')
@@ -130,6 +131,9 @@ def do_log_duration_info(basic_msg, func,
                          args, kwargs,
                          actual_duration,
                          log=perf_logger):
+    if func is None:
+        # Timing was disabled at compile time
+        return
 
     log_level = TRACE
     # Defer capturing the name; it might get changed at
@@ -165,7 +169,7 @@ def do_log_duration_info(basic_msg, func,
 def log_timed(func):
     counter = _counter
     log = do_log_duration_info
-    @functools.wraps(func)
+    @wraps(func)
     def f(*args, **kwargs):
         begin = counter()
         try:
@@ -179,14 +183,18 @@ def log_timed(func):
 
         return result
 
-    f.__wrapped__ = func # Py2 compat.
-
     # Store these on each individual function so they can be
     # tweaked later: Class.func.__wrapped__.min_duration_to_log = X
     func.log_levels = _LOG_TIMED_DEFAULT_DURATIONS
     func.log_details_threshold = _LOG_TIMED_DEFAULT_DETAILS_THRESHOLD
 
-    return f if _LOG_TIMED_COMPILETIME_ENABLE else func
+    if _LOG_TIMED_COMPILETIME_ENABLE:
+        return f
+
+    if getattr(func, '__wrapped__', func) is func:
+        func.__wrapped__ = None
+    return func
+
 
 def log_timed_only_self(func):
     func.log_args_only_self = 1
@@ -305,7 +313,7 @@ class Lazy(object):
         if name is None:
             name = func.__name__
         self.data = (func, name)
-        functools.update_wrapper(self, func)
+        update_wrapper(self, func)
 
     def __get__(self, inst, class_):
         if inst is None:
@@ -325,7 +333,7 @@ class CachedIn(object):
 
     def __call__(self, func):
 
-        @functools.wraps(func)
+        @wraps(func)
         def decorated(instance):
             cache = self.cache(instance)
             key = () # We don't support arguments right now, so only one key.

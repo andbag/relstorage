@@ -79,6 +79,10 @@ class Poller(object):
         """
         # pylint:disable=unused-argument
         # find out the tid of the most recent transaction.
+        # TODO: We could do this all in a single query if we add an order-by
+        # tid. We'd want to take care to only read the first row here, and then
+        # return a generator or itertools.chain to yield the row we popped first,
+        # followed by the remaining rows.
         self.poll_query.execute(cursor)
         rows = cursor.fetchall()
         if not rows or not rows[0][0]:
