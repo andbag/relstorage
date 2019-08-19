@@ -7,6 +7,10 @@
 
 - Several minor logging changes.
 
+- Fix importing RelStorage when ``zope.schema`` is not installed.
+  ``zope.schema`` is intended to be a test dependency and optional for
+  production deployments. Reported in :issue:`334` by Jonathan Lung.
+
 - Make the gevent MySQL driver more efficient at avoiding needless  waits.
 
 - Due to a bug in MySQL (incorrectly rounding the 'minute' value of a

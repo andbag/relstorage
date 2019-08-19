@@ -40,16 +40,32 @@ except ImportError: # pragma: no cover
     # We have nti.testing -> zope.schema as a test dependency; but we
     # don't have it as a hard-coded runtime dependency because we
     # don't want to force a version on consumers of RelStorage.
-    def _Field(description):
-        return Attribute(description)
+    class _Field(Attribute):
+        __allowed_kw__ = ()
+        def __init__(self, description, required=False, **kwargs):
+            description = "%s (required? %s)" % (description, required)
+            for k in self.__allowed_kw__:
+                kwargs.pop(k, None)
+            if kwargs:
+                raise TypeError("Unexpected keyword arguments: %r" % (kwargs,))
+            Attribute.__init__(self, description)
 
-    Tuple = _Field
-    Object = _Field
+    class Tuple(_Field):
+        __allowed_kw__ = ('value_type', )
+
+    class Object(_Field):
+        def __init__(self, schema, description=''):
+            description = "%s (Must provide %s)" % (description, schema)
+            super(Object, self).__init__(description)
+
     Bool = _Field
     Int = _Field
 
-    def Factory(schema, description='', **_kw):
-        return Attribute(description + " (Must implement %s)" % schema)
+    class Factory(_Field):
+        def __init__(self, schema, description='', **kwargs):
+            description = "%s (Must implement %s)" % (description, schema)
+            super(Factory, self).__init__(description, **kwargs)
+
 
     IException = Interface
 else:
