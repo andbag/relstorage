@@ -525,7 +525,7 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
 
             for wref in self.registered_viewers:
                 viewer = wref()
-                if viewer is None or viewer is cache or not viewer.highest_visible_tid::
+                if viewer is None or viewer is cache or not viewer.highest_visible_tid:
                     continue
                 assert viewer.highest_visible_tid >= polling_since, (viewer, polling_since)
                 if viewer == polling_since:
