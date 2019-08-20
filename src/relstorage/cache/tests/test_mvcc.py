@@ -206,18 +206,16 @@ class TestObjectIndex(TestCase):
         with self.assertRaises(AssertionError):
             ix.with_polled_changes(2, 1, None)
 
-    def test_polled_empty_but_wrong_tid(self):
+    def test_polled_empty_not_complete(self):
         # We assert for this impossible case
         initial_tid = 1
         ix = self._makeOne(highest_visible_tid=1)
         first_poll_tid = 1
         ix = ix.with_polled_changes(highest_visible_tid=first_poll_tid,
                                     complete_since_tid=initial_tid, changes=())
-        self.assertEqual(ix.maps[-1].complete_since_tid, first_poll_tid)
-
-
-        with self.assertRaises(AssertionError):
-            ix.with_polled_changes(first_poll_tid + 1, first_poll_tid, ())
+        # We didn't actually change the complete_since value, because without
+        # changes we can't actually be sure we're complete.
+        self.assertEqual(ix.maps[-1].complete_since_tid, None)
 
     def test_polled_same_tid_back_complete(self):
         initial_tid = 2

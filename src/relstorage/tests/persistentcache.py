@@ -79,8 +79,7 @@ class PersistentCacheStorageTests(TestCase):
 
     def assert_oid_not_known(self, oid, storage):
         cache = find_cache(storage)
-        self.assertNotIn(oid, cache.object_index)
-        self.assertNotIn(oid, cache.object_index)
+        self.assertNotIn(oid, cache.object_index or ())
 
     def assert_oid_known(self, oid, storage):
         cache = find_cache(storage)

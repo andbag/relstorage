@@ -37,6 +37,10 @@ from ._util import InvalidationMixin
 
 logger = __import__('logging').getLogger(__name__)
 
+# debug = print
+def debug(*_args):
+    "Does nothing"
+
 ###
 # Notes on in-process concurrency:
 #
@@ -106,13 +110,19 @@ class _TransactionRangeObjectIndex(OidTMap):
         Given an incomplete bucket (this object) and a complete bucket for the
         same or a later TID, merge this one to hold the same data and be complete
         for the same transaction range.
+
+        This bucket will be complete for the given bucket's completion, *if* the
+        given bucket actually had a different tid than this one. If the given
+        bucket was the same tid, then nothing changed and we can't presume
+        to be complete.
         """
         assert not self.complete_since_tid
         assert newer_bucket.complete_since_tid
         assert newer_bucket.highest_visible_tid >= self.highest_visible_tid
         self.update(newer_bucket)
-        self.highest_visible_tid = newer_bucket.highest_visible_tid
-        self.complete_since_tid = newer_bucket.complete_since_tid
+        if newer_bucket.highest_visible_tid > self.highest_visible_tid:
+            self.highest_visible_tid = newer_bucket.highest_visible_tid
+            self.complete_since_tid = newer_bucket.complete_since_tid
 
     def merge_same_tid(self, bucket):
         """
@@ -139,7 +149,7 @@ class _TransactionRangeObjectIndex(OidTMap):
             self.complete_since_tid = bucket.complete_since_tid
 
     def close(self):
-        self.highest_visible_tid = -1
+        self.highest_visible_tid = None
         self.clear()
 
     # These raise ValueError if the map is empty
@@ -319,11 +329,17 @@ class _ObjectIndex(object):
         # we'll see the object from the future when we poll for changes.
 
         for mapping in reversed(self.maps):
-            if tid <= mapping.highest_visible_tid:
-                assert mapping.complete_since_tid is None or tid <= mapping.complete_since_tid
-                mapping[oid] = tid
-                # print("Setting item", oid, tid, mapping)
-                break
+            if mapping.highest_visible_tid and tid > mapping.highest_visible_tid:
+                continue
+            if mapping.complete_since_tid and tid > mapping.complete_since_tid:
+                assert oid in mapping, (dict(mapping), oid, tid, mapping)
+                assert mapping[oid] == tid, dict(mapping)
+                continue
+
+            debug("Storing", oid, "at", tid, "into", mapping, dict(mapping))
+            assert mapping.complete_since_tid is None or tid <= mapping.complete_since_tid
+            mapping[oid] = tid
+            break
             # TODO: Do we want to store it everywhere possible for speed,
             # at the cost of memory?
 
@@ -341,16 +357,22 @@ class _ObjectIndex(object):
     def complete_since_tid(self):
         return self.maps[-1].complete_since_tid
 
-    def invalidate(self, oid_int, tid_int):
-        bound = tid_int + 1
-        for mapping in self.maps:
-            if mapping.get(oid_int, bound) <= tid_int:
-                del mapping[oid_int]
+    # We can't actually remove things from the maps;
+    # if we think we have complete information for a range
+    # of transactions, then we better have the complete info.
+    def invalidate(self, oid_int, tid_int): # pylint:disable=unused-argument
+        return
+        # bound = tid_int + 1
+        # for mapping in self.maps:
+        #     if mapping.get(oid_int, bound) <= tid_int:
+        #         print("Invalidating", oid_int, tid_int, mapping)
+        #         del mapping[oid_int]
 
-    def invalidate_all(self, oids):
-        for mapping in self.maps:
-            for oid in oids:
-                mapping.pop(oid, None)
+    def invalidate_all(self, oids): # pylint:disable=unused-argument
+        return
+        # for mapping in self.maps:
+        #     for oid in oids:
+        #         mapping.pop(oid, None)
 
     def verify(self):
         # Each component has values in range.
@@ -386,8 +408,9 @@ class _ObjectIndex(object):
             assert highest_visible_tid >= oldest_bucket.highest_visible_tid
             # Overwrite the incomplete data with the new data, which is complete
             # back to a point. The make the incomplete data become the complete data
-            # print("Oldest bucket", oldest_bucket, "completing to", incoming_bucket)
+            debug("Oldest bucket", oldest_bucket, "completing to", incoming_bucket)
             oldest_bucket.complete_to(incoming_bucket)
+            debug("Oldest bucket is now", oldest_bucket)
             return self
 
         # Special cases:
@@ -407,7 +430,7 @@ class _ObjectIndex(object):
         )
 
         if highest_visible_tid == newest_bucket.highest_visible_tid:
-            # print("Merging for same tid", newest_bucket, "incoming", incoming_bucket)
+            debug("Merging for same tid", newest_bucket, "incoming", incoming_bucket)
             newest_bucket.merge_same_tid(incoming_bucket)
             return self
 
@@ -474,18 +497,18 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
         # Note that poll_invalidations can raise StaleConnectionError,
         # or it can return (None, old_tid) where old_tid is less than
         # its third parameter (``prev_polled_tid``)
-        # print("Entering poll")
+        debug("Entering poll")
         if self.object_index is None:
-            # print("Initial poll for", cache)
+            debug("Initial poll for", cache)
             # Initial poll for the world. Do this locked to be sure we
             # have a consistent state.
             change_iter, tid = cache.adapter.poller.poll_invalidations(conn, cursor, None, None)
             assert change_iter is None
             if tid > 0:
-                # print("Found data; can begin caching", cache, tid)
+                debug("Found data; can begin caching", cache, tid)
                 # tid 0 is empty database, no data.
                 self.object_index = _ObjectIndex(tid)
-            # print("Initial got tid", tid, self.object_index)
+            debug("Initial got tid", tid, self.object_index)
             return change_iter, tid or None, self.object_index or {}
 
 
@@ -498,7 +521,7 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
             None)
         if tid == 0 or tid < polling_since:
             assert change_iter is None
-            # print("Freshly zapped or empty db", tid, polling_since, change_iter)
+            debug("Freshly zapped or empty db", tid, polling_since, change_iter)
             # Freshly zapped or empty database (tid==0)
             # or stale and asked to revert
             self.object_index = None
@@ -508,13 +531,13 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
         # Let's do it.
         # Will need to be able to iterate this more than once.
         change_iter = list(change_iter)
-        # print("Changes since", polling_since, "now at", tid, "are", change_iter)
+        debug("Changes since", polling_since, "now at", tid, "are", change_iter)
         prev_index = self.object_index
         ix_up = _ObjectIndex if prev_index is None else prev_index.with_polled_changes
         self.object_index = new_index = ix_up(tid, polling_since, change_iter)
 
         if len(new_index.maps) < 2:
-            # print("Nothing to freeze", new_index)
+            debug("Nothing to freeze", new_index)
             return change_iter, tid, new_index
 
         prev_min_highest_visible_tid = prev_index.minimum_highest_visible_tid
@@ -533,20 +556,21 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
                     move_forward = False
                     break
         if move_forward:
-            # print("Moving forward from", prev_min_highest_visible_tid, "to", tid)
+            debug("Moving forward from", prev_min_highest_visible_tid, "to", tid)
             oldest_bucket = new_index.maps[-2]
             obsolete_bucket = new_index.maps.pop()
-            # print("Merging together", oldest_bucket, "with obsolete", obsolete_bucket)
-            # print("Oldest data", dict(oldest_bucket))
-            # print("Obsolete data", dict(obsolete_bucket))
+            debug("Merging together", oldest_bucket, "with obsolete", obsolete_bucket)
+            debug("Oldest data", dict(oldest_bucket))
+            debug("Obsolete data", dict(obsolete_bucket))
             oldest_bucket.merge_older_tid(obsolete_bucket)
-            # print("Did merge", oldest_bucket, dict(oldest_bucket))
+            debug("Did merge", oldest_bucket, dict(oldest_bucket))
             # XXX: TODO: Here is where we should freeze things.
             # Remove old TIDs from the map, and re-cache objects with the new key.
             obsolete_bucket.close()
-            # print("Closed", obsolete_bucket, dict(obsolete_bucket))
+            debug("Closed", obsolete_bucket, dict(obsolete_bucket))
+            debug("Oldest still", oldest_bucket, dict(oldest_bucket))
 
-        # print("After freeze; changes", change_iter, "new tid", tid, "index", new_index)
+        debug("After freeze; changes", change_iter, "new tid", tid, "index", new_index)
         return change_iter, tid, new_index
 
     def flush_all(self):

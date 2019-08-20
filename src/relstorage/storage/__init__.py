@@ -714,6 +714,7 @@ class RelStorage(LegacyMethodsMixin,
             # that in self.pack() until we write more specific tests.
             log.error("ReadConflictError from polling invalidations; %s", e)
             self.__stale(e)
+            return
 
         if changes is None:
             # This is reset by poll_invalidations.
@@ -751,8 +752,8 @@ class RelStorage(LegacyMethodsMixin,
             # root and hence was packed away). Not only do we need to restart our
             # connection, we also need to restart our polling.
             # XXX: Need a method for this
-            self._cache.highest_visible_tid = None
-            self._cache.object_index = {}
+            self._cache.object_index = None
+            self._cache.polling_state.object_index = None
         self.sync()
 
         self._pack_finished()

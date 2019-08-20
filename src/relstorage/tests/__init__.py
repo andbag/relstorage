@@ -118,8 +118,10 @@ class TestCase(unittest.TestCase):
         return o
 
     def tearDown(self):
-        transaction.abort()
-        super(TestCase, self).tearDown()
+        try:
+            transaction.abort()
+        finally:
+            super(TestCase, self).tearDown()
 
     def assertIsEmpty(self, container):
         self.assertLength(container, 0)

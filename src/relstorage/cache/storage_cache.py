@@ -43,7 +43,6 @@ from relstorage.cache.memcache_client import MemcacheStateCache
 from relstorage.cache.trace import ZEOTracer
 from relstorage.cache._statecache_wrappers import MultiStateCache
 from relstorage.cache._statecache_wrappers import TracingStateCache
-from relstorage.cache._util import InvalidationMixin
 from relstorage.cache.mvcc import MVCCDatabaseCoordinator
 
 logger = log = logging.getLogger(__name__)
@@ -113,19 +112,17 @@ class StorageCache(object):
             self.local_client = _parent.local_client.new_instance()
             self.cache = _parent.cache.new_instance()
 
-        self.highest_visible_tid = None
-        self.object_index = {}
+        self.object_index = None
 
         if _parent is None:
             self.restore()
 
     @property
-    def current_tid(self):
-        return self.highest_visible_tid
+    def highest_visible_tid(self):
+        index = self.object_index
+        return index.highest_visible_tid if index else None
 
-    @current_tid.setter
-    def current_tid(self, nv):
-        self.highest_visible_tid = nv
+    current_tid = highest_visible_tid
 
     # XXX: Note that our __bool__ and __len__ are NOT consistent
     def __bool__(self):
@@ -252,8 +249,7 @@ class StorageCache(object):
         method returns.
         """
         # As if we've never polled
-        self.highest_visible_tid = None
-        self.object_index = {}
+        self.object_index = None
         if message:
             raise CacheConsistencyError(message)
 
@@ -298,7 +294,7 @@ class StorageCache(object):
     def _check_tid_after_load(self, oid_int, actual_tid_int,
                               expect_tid_int=None):
         """Verify the tid of an object loaded from the database is sane."""
-        if actual_tid_int > self.current_tid:
+        if actual_tid_int > self.object_index.highest_visible_tid:
             # Strangely, the database just gave us data from a future
             # transaction. We can't give the data to ZODB because that
             # would be a consistency violation. However, the cause is
@@ -390,7 +386,7 @@ class StorageCache(object):
         # As for load(), if we haven't polled, we can't trust our cache.
         # If we've polled, but we're being asked for data from the future,
         # we can't answer.
-        if not self.object_index or tid_int > self.highest_visible_tid:
+        if not self.highest_visible_tid or tid_int > self.highest_visible_tid:
             return None
 
         if not self.options.keep_history:
@@ -430,7 +426,7 @@ class StorageCache(object):
         Returns (state_bytes, tid_int).
         """
         # pylint:disable=too-many-statements,too-many-branches,too-many-locals
-        if not self.object_index:
+        if not self.highest_visible_tid:
             # No poll has occurred yet. For safety, don't use the cache.
             # Note that without going through the cache, we can't
             # go through tracing either.
@@ -690,8 +686,7 @@ class StorageCache(object):
             self.temp_objects = None
 
     def poll(self, conn, cursor, ignore_tid):
-        changes, new_tid, new_index = self.polling_state.poll(self, conn, cursor)
-        self.highest_visible_tid = new_tid
+        changes, _new_tid, new_index = self.polling_state.poll(self, conn, cursor)
         self.object_index = new_index
         if changes is not None:
             return OIDSet(oid for oid, tid in changes if tid != ignore_tid)
