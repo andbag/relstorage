@@ -63,7 +63,7 @@ _UsedAfterRelease = _UsedAfterRelease()
 
 
 @interface.implementer(IStorageCache, IPersistentCache)
-class StorageCache(InvalidationMixin):
+class StorageCache(object):
     """RelStorage integration with memcached or similar.
 
     Holds a list of memcache clients in order from most local to
@@ -151,9 +151,10 @@ class StorageCache(InvalidationMixin):
         return self.local_client.stats()
 
     def __repr__(self):
-        return "<%s at 0x%x bytes=%d len=%d>" % (
+        return "<%s at 0x%x hvt=%s bytes=%d len=%d>" % (
             self.__class__.__name__,
             id(self),
+            self.highest_visible_tid,
             self.size,
             len(self)
         )
@@ -227,9 +228,11 @@ class StorageCache(InvalidationMixin):
                 # This is the authoritative location. We don't try as hard to
                 # store into the caches anymore.
                 # TODO: Work on the coupling here.
-                poll_cp = self.polling_state.checkpoints
-                if poll_cp:
-                    self.local_client.store_checkpoints(*poll_cp)
+                max_hvt = self.polling_state.maximum_highest_visible_tid
+                if max_hvt:
+                    self.local_client.store_checkpoints(
+                        max_hvt,
+                        self.polling_state.complete_since_tid or max_hvt)
                 return self.local_client.save(**save_args)
             logger.debug("Cannot justify writing cache file, no hits or misses")
 
@@ -385,7 +388,9 @@ class StorageCache(InvalidationMixin):
         # a stale answer.
 
         # As for load(), if we haven't polled, we can't trust our cache.
-        if not self.object_index:
+        # If we've polled, but we're being asked for data from the future,
+        # we can't answer.
+        if not self.object_index or tid_int > self.highest_visible_tid:
             return None
 
         if not self.options.keep_history:
@@ -397,7 +402,7 @@ class StorageCache(InvalidationMixin):
                 # No good. Ok, well, this is for conflict resolution, so if the
                 # state was updated by someone else in this same process,
                 # and we can find it in our shared polling state we got lucky.
-                known_tid_int = self.polling_state.object_index.get(oid_int)
+                known_tid_int = self.polling_state.object_index[oid_int]
             if known_tid_int is not None and known_tid_int != tid_int:
                 return None
 
@@ -429,6 +434,7 @@ class StorageCache(InvalidationMixin):
             # No poll has occurred yet. For safety, don't use the cache.
             # Note that without going through the cache, we can't
             # go through tracing either.
+            # print("No index, db for", oid_int)
             return self.adapter.mover.load_current(cursor, oid_int)
 
         # Get the object from the transaction specified
@@ -456,6 +462,7 @@ class StorageCache(InvalidationMixin):
         # same key twice.
         cache = self.cache
         tid_int = self.object_index[oid_int]
+        # print("Index for", oid_int, "is", tid_int)
         if tid_int:
             # This object changed after checkpoint0, so
             # there is only one place to look for its state: the exact key.
@@ -463,10 +470,12 @@ class StorageCache(InvalidationMixin):
             cache_data = cache[key]
             if cache_data:
                 # Cache hit.
+                # print("Cache hit for", oid_int, "at", tid_int, self.object_index)
                 assert cache_data[1] == tid_int, (cache_data[1], key)
                 return cache_data
 
             # Cache miss.
+            # print("Cache miss for", oid_int, "at", tid_int)
             state, actual_tid_int = self.adapter.mover.load_current(
                 cursor, oid_int)
             if state and actual_tid_int:
@@ -484,6 +493,7 @@ class StorageCache(InvalidationMixin):
         key = (oid_int, -1)
         cache_data = self.local_client[key]
         if cache_data:
+            # print("Found frozen", oid_int)
             assert cache_data[1] <= self.highest_visible_tid, (cache_data[1], key)
             return cache_data
 
@@ -491,11 +501,13 @@ class StorageCache(InvalidationMixin):
         state, tid_int = self.adapter.mover.load_current(cursor, oid_int)
         if tid_int:
             self._check_tid_after_load(oid_int, tid_int)
-            if tid_int < self.polling_state.complete_since_tid:
+            complete_since = self.polling_state.complete_since_tid
+            if complete_since and tid_int < complete_since:
                 key = (oid_int, -1)
             else:
                 key = (oid_int, tid_int)
                 self.object_index[oid_int] = tid_int
+            # print("Storing after misses", key)
             cache[key] = (state, tid_int)
 
         return state, tid_int
@@ -520,7 +532,7 @@ class StorageCache(InvalidationMixin):
             cache_data = cache[key]
             if not cache_data:
                 # That was our one place, so we must fetch
-                to_fetch[oid_int] = key
+                to_fetch.add(oid_int)
 
         if not to_fetch:
             return
@@ -539,7 +551,6 @@ class StorageCache(InvalidationMixin):
         See notes in `invalidate_all`.
         """
         del self.cache[(oid_int, tid_int)]
-        self._invalidate(oid_int, tid_int)
         self.polling_state.invalidate(oid_int, tid_int)
 
     def invalidate_all(self, oids):
@@ -555,7 +566,7 @@ class StorageCache(InvalidationMixin):
         pack or undo.
         """
         # Erase our knowledge of where to look
-        self._invalidate_all(oids)
+        # self._invalidate_all(oids)
         # Remove the data too.
         self.cache.invalidate_all(oids)
         self.polling_state.invalidate_all(oids)
@@ -637,6 +648,7 @@ class StorageCache(InvalidationMixin):
         # knowing when a connection is sitting idle and not being
         # used. ``after_tpc_finish`` isn't enough for that, we need a
         # hook from the storage.
+
 
         # store = self.delta_after0.__setitem__
         # if not self.keep_history:

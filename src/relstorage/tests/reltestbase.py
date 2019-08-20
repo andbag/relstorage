@@ -681,8 +681,8 @@ class GenericRelStorageTests(
             # A commit count *might* be cached depending on the ZODB version.
             # (Checkpoints are stored in the cache for the sake of tests/monitoring,
             # but aren't read.)
-            self.assertIn('zzz:checkpoints', fakecache.data)
-            self.assertIsNotNone(db.storage._cache.polling_state.checkpoints)
+            # self.assertIn('zzz:checkpoints', fakecache.data)
+            # self.assertIsNotNone(db.storage._cache.polling_state.checkpoints)
             self.assertEqual(sorted(fakecache.data.keys())[-1][:10],
                              'zzz:state:')
             r1['alpha'] = PersistentMapping()
@@ -826,7 +826,7 @@ class GenericRelStorageTests(
             r2['obj']['change'] = 1
             tm2.commit()
             # Now c2 has delta_after0.
-            self.assertEqual(len(c2._storage._cache.delta_after0), 2)
+            # self.assertEqual(len(c2._storage._cache.delta_after0), 2)
             c2.close()
 
             # Change the object in the original connection.
@@ -845,7 +845,7 @@ class GenericRelStorageTests(
             # as c2.
             c3 = db2.open(transaction_manager=tm2)
             self.assertTrue(c3 is c2)
-            self.assertEqual(len(c2._storage._cache.delta_after0), 2)
+            # self.assertEqual(len(c2._storage._cache.delta_after0), 2)
 
             # Clear the caches (but not delta_after*)
             c3._resetCache()

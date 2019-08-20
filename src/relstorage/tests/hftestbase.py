@@ -31,6 +31,8 @@ from ZODB.tests.StorageTestBase import zodb_unpickle
 # so we need to explicitly place it at the back of the MRO.
 from ZODB.tests.util import TestCase as ZODBTestCase
 
+from relstorage._util import bytes8_to_int64
+
 from relstorage.tests.RecoveryStorage import BasicRecoveryStorage
 from relstorage.tests.RecoveryStorage import UndoableRecoveryStorage
 from relstorage.tests.reltestbase import GenericRelStorageTests
@@ -114,6 +116,7 @@ class HistoryFreeRelStorageTests(GenericRelStorageTests, ZODBTestCase):
         obj.value = 3
         revid3 = self._dostoreNP(oid, revid=revid2, data=pdumps(obj))
         # Now make sure only the latest revision can be extracted
+        __traceback_info__ = [bytes8_to_int64(x) for x in (oid, revid1, revid2)]
         raises(KeyError, self._storage.loadSerial, oid, revid1)
         raises(KeyError, self._storage.loadSerial, oid, revid2)
         data = self._storage.loadSerial(oid, revid3)
