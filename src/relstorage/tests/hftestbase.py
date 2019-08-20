@@ -125,10 +125,7 @@ class HistoryFreeRelStorageTests(GenericRelStorageTests, ZODBTestCase):
         eq(pobj.value, 3)
         # Now pack.  The object should stay alive because it's pointed
         # to by the root.
-        now = packtime = time.time()
-        while packtime <= now:
-            packtime = time.time()
-        self._storage.pack(packtime, referencesf)
+        self._storage.pack(self._storage.lastTransactionInt(), referencesf)
         # Make sure the revisions are gone, but that object zero and revision
         # 3 are still there and correct
         data, revid = self._storage.load(ZERO, '')

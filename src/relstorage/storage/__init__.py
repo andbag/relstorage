@@ -750,10 +750,10 @@ class RelStorage(LegacyMethodsMixin,
             # test scenarios (e.g., the last transaction in the database is an object that
             # was directly stored without any connection to the object graph starting from the
             # root and hence was packed away). Not only do we need to restart our
-            # connection, we also need to restart our polling.
-            # XXX: Need a method for this
-            self._cache.object_index = None
-            self._cache.polling_state.object_index = None
+            # connection, we also need to restart our polling. Moreover, to prevent
+            # loadSerial() from finding cached data, we also need to flush our caches.
+            self._cache.clear(load_persistent=False)
+
         self.sync()
 
         self._pack_finished()

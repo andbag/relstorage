@@ -476,10 +476,12 @@ class GenericRelStorageTests(
         # bound to connections.
         obj = ConflictResolution.PCounter()
         obj.inc()
-
+        # Establish a polling state; dostoreNP won't.
+        self._storage.poll_invalidations()
         oid = self._storage.new_oid()
 
         revid1 = self._dostoreNP(oid, data=zodb_pickle(obj))
+        self._storage.poll_invalidations()
         # These will both poll and get the state for (oid, revid1)
         # cached at that location, where it will be found during conflict
         # resolution.
@@ -489,9 +491,9 @@ class GenericRelStorageTests(
         storage2 = self._storage.new_instance()
         storage2.load(oid, '')
         # Remember that the cache stats are shared between instances.
-        # They were both able to get the data that the root storage put in the cache.
-
-        self.assertEqual(storage1._cache.stats()['hits'], 2)
+        # The first had to fetch it, the second can use it.
+        __traceback_info__ = storage1._cache.stats()
+        self.assertEqual(storage1._cache.stats()['hits'], 1)
         storage1._cache.reset_stats()
         if clear_cache:
             storage1._cache.clear(load_persistent=False)
@@ -528,12 +530,12 @@ class GenericRelStorageTests(
 
             cache_stats = storage1._cache.stats()
             __traceback_info__ = cache_stats, clear_cache
-            if clear_cache or not self.keep_history:
+            if clear_cache:
                 self.assertEqual(cache_stats['misses'], 2)
-                self.assertEqual(cache_stats['hits'], 1)
+                self.assertEqual(cache_stats['hits'], 0)
             else:
                 self.assertEqual(cache_stats['misses'], 0)
-                self.assertEqual(cache_stats['hits'], 2)
+                self.assertEqual(cache_stats['hits'], 1)
 
             data, _serialno = self._storage.load(oid, '')
             inst = zodb_unpickle(data)
@@ -689,9 +691,10 @@ class GenericRelStorageTests(
             transaction.commit()
             cp_count = 1
             if self.keep_history:
-                item_count = 3
+                item_count = 2
             else:
                 # The previous root state was automatically invalidated
+                # XXX: We go back and forth on that.
                 item_count = 2
             item_count += cp_count
             self.assertEqual(len(fakecache.data), item_count)
@@ -704,9 +707,9 @@ class GenericRelStorageTests(
             # make a change
             r1['beta'] = 0
             transaction.commit()
-            if self.keep_history:
-                # Once again, history free automatically invalidated.
-                item_count += 1
+            # Once again, history free automatically invalidated.
+            # XXX: Depending on my mood.
+            item_count += 1
             self.assertEqual(len(fakecache.data), item_count)
 
             c1._storage.load(oid, '')
@@ -1045,15 +1048,24 @@ class GenericRelStorageTests(
 
             d = tempfile.mkdtemp()
             try:
+                # Snapshot the database.
                 fs = FileStorage(os.path.join(d, 'Data.fs'))
                 fs.copyTransactionsFrom(c._storage)
 
+                # Change data in it.
                 r['beta'] = PersistentMapping()
                 transaction.commit()
                 self.assertTrue('beta' in r)
 
-                c._storage.zap_all(reset_oid=False, slow=True)
-                c._storage.copyTransactionsFrom(fs)
+                # Revert the data.
+                # We must use a separate, unrelated storage object to do this,
+                # because our storage object is smart enough to notice that the data
+                # has been zapped and revert caches for all connections and
+                # ZODB objects when we invoke this API.
+                storage_2 = self.make_storage(zap=False)
+                storage_2.zap_all(reset_oid=False, slow=True)
+                storage_2.copyTransactionsFrom(fs)
+                storage_2.close()
 
                 fs.close()
             finally:
@@ -1283,8 +1295,11 @@ class GenericRelStorageTests(
         if self.keep_history:
             item_count = 3
         else:
-            # The new state for the root invalidated the old state.
-            item_count = 2
+            # The new state for the root invalidated the old state,
+            # but we keep the old state available for loadSerial,
+            # at least as long as connections might be using it.
+            # XXX: This changes as we change the cache strategy.
+            item_count = 3
         self.assertEqual(item_count, len(self._storage._cache))
         self._storage._cache.clear()
         self.assertEmpty(self._storage._cache)

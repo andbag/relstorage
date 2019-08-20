@@ -47,7 +47,7 @@ class PersistentCacheStorageTests(TestCase):
             self,
             expected_checkpoints=None,
             expected_root_tid=None,
-    ):
+    ): # pylint:disable=unused-argument
         """
         Make a storage that reads a persistent cache that
         already exists.
@@ -60,11 +60,11 @@ class PersistentCacheStorageTests(TestCase):
         #     self.assertEqual(cache.checkpoints, expected_checkpoints)
 
         if expected_root_tid is not None:
-            self.assert_oid_known(ROOT_OID, storage)
-            self.assertEqual(cache.delta_after0[0], expected_root_tid)
+            tid = self.assert_oid_known(ROOT_OID, storage)
+            self.assertEqual(tid, expected_root_tid)
         else:
             self.assert_oid_not_known(ROOT_OID, storage)
-        self.assertIsNotNone(cache.current_tid)
+        self.assertIsNotNone(cache.polling_state.maximum_highest_visible_tid)
         return storage
 
     def __make_storage_no_pcache(self):
@@ -83,8 +83,9 @@ class PersistentCacheStorageTests(TestCase):
 
     def assert_oid_known(self, oid, storage):
         cache = find_cache(storage)
-        self.assertIn(oid, cache.object_index)
-        return cache.object_index[oid]
+        index = cache.object_index or cache.polling_state.object_index or ()
+        self.assertIn(oid, index)
+        return index[oid]
 
     def assert_tid_after(self, oid, tid, storage):
         cache = find_cache(storage)
@@ -112,7 +113,14 @@ class PersistentCacheStorageTests(TestCase):
     def assert_cached(self, oid, tid, storage):
         cache = find_cache(storage)
         cache_data = cache.local_client[(oid, tid)]
-        __traceback_info__ = (oid, tid), [k for k in cache.local_client if k[0] == oid]
+        __traceback_info__ = (
+            (oid, tid),
+            cache.object_index,
+            cache.polling_state.object_index,
+            [k
+             for k in cache.local_client
+             if k[0] == oid]
+        )
         self.assertIsNotNone(cache_data)
         return cache_data
 
@@ -178,7 +186,8 @@ class PersistentCacheStorageTests(TestCase):
                               old_data,
                               pack=False):
         """
-        And return the transaction ID and current checkpoints.
+        And return the transaction ID of when we mad the change,
+        and the transaction ID of the last time the root changed.
 
         Uses an independent transaction.
 
@@ -202,7 +211,7 @@ class PersistentCacheStorageTests(TestCase):
         if pack:
             storage.pack(tid_int, referencesf)
         db1.close()
-        return tid_int, None
+        return tid_int, bytes8_to_int64(root._p_serial)
 
     def __set_key_in_root_to(self,
                              storage,
@@ -308,7 +317,7 @@ class PersistentCacheStorageTests(TestCase):
 
 
     def checkNoConflictWhenChangeMissedByPersistentCacheBeforeCP1(self):
-        _root_tid, _mapping_tid, db = self._populate_root_and_mapping()
+        root_tid, _mapping_tid, db = self._populate_root_and_mapping()
 
         # Make some changes to the root in a storage that will not
         # read or update the persistent cache.
@@ -325,13 +334,12 @@ class PersistentCacheStorageTests(TestCase):
         db.close()
 
         # Now a new storage that will read the persistent cache
-        # The root object, however, was not put into a delta map.
         storage3 = self.__make_storage_pcache(
             expected_checkpoints=(new_tid, new_tid),
             expected_root_tid=None,
         )
-        # Nor is it in the cache at any key.
-        self.assert_oid_not_cached(ROOT_OID, storage3)
+        # The root object is cached still
+        self.assert_cached(ROOT_OID, root_tid, storage3)
 
         # We can successfully open and edit the root object.
         self.__set_key_in_root_to(storage3, 180, old_tid=new_tid, old_value=420)
@@ -341,7 +349,7 @@ class PersistentCacheStorageTests(TestCase):
 
         # Make some changes to the sub-object, and not the root, in a storage that will not
         # read or update the persistent cache.
-        new_tid, _ = self.__set_key_in_root_to(
+        new_tid, root_tid = self.__set_key_in_root_to(
             self.__make_storage_no_pcache(),
             420,
             key='myobj1.key',
@@ -360,9 +368,9 @@ class PersistentCacheStorageTests(TestCase):
             # No root TID in delta after 0
             expected_root_tid=None
         )
-        # But it is in the cache for its old key, because we verified it
+        # But it is in the cache for its correct key, because we verified it
         # to still be in sync.
-        cache_data = self.assert_cached(ROOT_OID, new_tid, storage)
+        cache_data = self.assert_cached(ROOT_OID, root_tid, storage)
         self.assertEqual(cache_data[1], root_tid)
 
         self.__set_keys_in_root_to(
@@ -399,7 +407,7 @@ class PersistentCacheStorageTests(TestCase):
         # self.assert_checkpoints(c1, (root_tid, root_tid))
 
         # the root is not in a delta
-        self.assert_oid_not_known(ROOT_OID, c1)
+        # self.assert_oid_not_known(ROOT_OID, c1)
 
         # Though it is in the cache.
         self.assert_cached_exact(ROOT_OID, root_tid, c1)
@@ -428,13 +436,13 @@ class PersistentCacheStorageTests(TestCase):
         )
         # The deleted object was not put in a delta map
         self.assert_oid_not_known(nested_mapping_oid_int, storage)
-        # Nor is it in a cache at the old key
-        self.assert_oid_not_cached(nested_mapping_oid_int, storage)
+        # Though it remains cached.
+        # self.assert_oid_not_cached(nested_mapping_oid_int, storage)
 
         # Likewise, the parent mapping isn't found anywhere, because it
         # changed
         self.assert_oid_not_known(mapping_oid_int, storage)
-        self.assert_oid_not_cached(mapping_oid_int, storage)
+        # self.assert_oid_not_cached(mapping_oid_int, storage)
 
         self.__set_keys_in_root_to(
             storage,

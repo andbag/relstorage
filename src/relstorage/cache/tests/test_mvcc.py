@@ -184,9 +184,10 @@ class TestObjectIndex(TestCase):
         ]
 
         ix2 = ix.with_polled_changes(new_polled_tid, complete_since_tid, changes)
-        # Same object back.
-        self.assertIs(ix2, ix)
-        self.assertIs(ix2.maps[0], initial_map)
+        # We did not get the same object back, because the tid changed,
+        # and we can't do that.
+        self.assertIsNot(ix2, ix)
+        self.assertIsNot(ix2.maps[0], initial_map)
         # Verifies.
         ix2.verify()
         self.assertEqual(ix2.maximum_highest_visible_tid, new_polled_tid)

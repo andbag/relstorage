@@ -58,7 +58,12 @@ class _UsedAfterRelease(object):
     new_instance = lambda s: s
 _UsedAfterRelease = _UsedAfterRelease()
 
-
+def _debug(*_args):
+    "Does nothing"
+if 0: # pylint:disable=using-constant-test
+    debug = print
+else:
+    debug = _debug
 
 
 @interface.implementer(IStorageCache, IPersistentCache)
@@ -112,6 +117,11 @@ class StorageCache(object):
             self.local_client = _parent.local_client.new_instance()
             self.cache = _parent.cache.new_instance()
 
+        # Once we have registered with the MVCCDatabaseCoordinator,
+        # we cannot make any changes to our own mvcc state without
+        # letting it know about them. In particular, that means we must
+        # not just assign to this object (except under careful circumstances
+        # where we're sure to be single threaded.)
         self.object_index = None
 
         if _parent is None:
@@ -148,12 +158,13 @@ class StorageCache(object):
         return self.local_client.stats()
 
     def __repr__(self):
-        return "<%s at 0x%x hvt=%s bytes=%d len=%d>" % (
+        return "<%s at 0x%x hvt=%s bytes=%d len=%d state=%r>" % (
             self.__class__.__name__,
             id(self),
             self.highest_visible_tid,
             self.size,
-            len(self)
+            len(self),
+            self.polling_state,
         )
 
     def reset_stats(self):
@@ -189,7 +200,7 @@ class StorageCache(object):
         self.polling_state = _UsedAfterRelease
         # We can't be used to make instances any more.
         self.new_instance = _UsedAfterRelease
-        self.object_index = {}
+        self.object_index = None
 
     def close(self, **save_args):
         """
@@ -249,7 +260,7 @@ class StorageCache(object):
         method returns.
         """
         # As if we've never polled
-        self.object_index = None
+        self.polling_state.reset_viewer(self)
         if message:
             raise CacheConsistencyError(message)
 
@@ -270,13 +281,6 @@ class StorageCache(object):
         """
         self._reset()
         self.polling_state.flush_all()
-        # After this our current_tid is probably out of sync with the
-        # storage's current_tid. Whether or not we load data from
-        # persistent caches, it's probably in the past of what the
-        # storage thinks.
-        # XXX: Ideally, we should be able to populate that information
-        # back up so that we get the right polls.
-
         self.cache.flush_all()
 
         if load_persistent:
@@ -387,6 +391,8 @@ class StorageCache(object):
         # If we've polled, but we're being asked for data from the future,
         # we can't answer.
         if not self.highest_visible_tid or tid_int > self.highest_visible_tid:
+            #debug("Not loadSerial; my hvt:", self.highest_visible_tid,
+            #      "Requested tid", tid_int)
             return None
 
         if not self.options.keep_history:
@@ -401,6 +407,7 @@ class StorageCache(object):
                 known_tid_int = self.polling_state.object_index[oid_int]
             if known_tid_int is not None and known_tid_int != tid_int:
                 return None
+            #debug("Known tid for oid", oid_int, "is", known_tid_int, "need", tid_int)
 
         # If we've seen this object, it could be in a few places:
         # (oid, tid) (if it was ever in a delta), or (oid, cp0)
@@ -430,7 +437,7 @@ class StorageCache(object):
             # No poll has occurred yet. For safety, don't use the cache.
             # Note that without going through the cache, we can't
             # go through tracing either.
-            # print("No index, db for", oid_int)
+            #debug("No index, db for", oid_int)
             return self.adapter.mover.load_current(cursor, oid_int)
 
         # Get the object from the transaction specified
@@ -458,7 +465,7 @@ class StorageCache(object):
         # same key twice.
         cache = self.cache
         tid_int = self.object_index[oid_int]
-        # print("Index for", oid_int, "is", tid_int)
+        #debug("Index for", oid_int, "is", tid_int)
         if tid_int:
             # This object changed after checkpoint0, so
             # there is only one place to look for its state: the exact key.
@@ -466,12 +473,12 @@ class StorageCache(object):
             cache_data = cache[key]
             if cache_data:
                 # Cache hit.
-                # print("Cache hit for", oid_int, "at", tid_int, self.object_index)
+                #debug("Cache hit for", oid_int, "at", tid_int, self.object_index)
                 assert cache_data[1] == tid_int, (cache_data[1], key)
                 return cache_data
 
             # Cache miss.
-            # print("Cache miss for", oid_int, "at", tid_int)
+            #debug("Cache miss for", oid_int, "at", tid_int)
             state, actual_tid_int = self.adapter.mover.load_current(
                 cursor, oid_int)
             if state and actual_tid_int:
@@ -489,7 +496,7 @@ class StorageCache(object):
         key = (oid_int, -1)
         cache_data = self.local_client[key]
         if cache_data:
-            # print("Found frozen", oid_int)
+            #debug("Found frozen", oid_int)
             assert cache_data[1] <= self.highest_visible_tid, (cache_data[1], key)
             return cache_data
 
@@ -503,7 +510,7 @@ class StorageCache(object):
             else:
                 key = (oid_int, tid_int)
                 self.object_index[oid_int] = tid_int
-            # print("Storing after misses", key)
+            #debug("Storing after misses", key)
             cache[key] = (state, tid_int)
 
         return state, tid_int
@@ -609,6 +616,7 @@ class StorageCache(object):
         #
         # TODO: Create a special subclass for MVCC instances and separate
         # the state handling.
+        #debug("After_tpc_finish", list(self.temp_objects.stored_oids))
         self.cache.set_all_for_tid(tid_int, self.temp_objects)
 
         # If we aren't keeping history, then a previous revision of
@@ -686,8 +694,7 @@ class StorageCache(object):
             self.temp_objects = None
 
     def poll(self, conn, cursor, ignore_tid):
-        changes, _new_tid, new_index = self.polling_state.poll(self, conn, cursor)
-        self.object_index = new_index
+        changes = self.polling_state.poll(self, conn, cursor)
         if changes is not None:
             return OIDSet(oid for oid, tid in changes if tid != ignore_tid)
 

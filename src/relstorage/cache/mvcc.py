@@ -26,20 +26,20 @@ import weakref
 from zope.interface import implementer
 
 from relstorage._compat import iterkeys
-from relstorage._compat import OID_OBJECT_MAP_TYPE as OidOMap
 from relstorage._compat import OID_TID_MAP_TYPE as OidTMap
-from relstorage._compat import OID_SET_TYPE as OidSet
-from relstorage._compat import iteroiditems
-from relstorage._util import log_timed
+
 
 from .interfaces import IStorageCacheMVCCDatabaseCoordinator
 from ._util import InvalidationMixin
 
 logger = __import__('logging').getLogger(__name__)
 
-# debug = print
-def debug(*_args):
+def _debug(*_args):
     "Does nothing"
+if 0: # pylint:disable=using-constant-test
+    debug = print
+else:
+    debug = _debug
 
 ###
 # Notes on in-process concurrency:
@@ -143,9 +143,10 @@ class _TransactionRangeObjectIndex(OidTMap):
         in the incoming data.
         """
         assert bucket.highest_visible_tid <= self.highest_visible_tid
-        bucket.update(self) # overwrite with our data
-        self.update(bucket) # bring back to ourself.
-        if bucket.complete_since_tid < self.complete_since_tid:
+        # TODO: There's probably a better way to do this.
+        bucket.update(self) # overwrite old data with our data
+        self.update(bucket) # bring missing data into ourself.
+        if bucket.complete_since_tid and bucket.complete_since_tid < self.complete_since_tid:
             self.complete_since_tid = bucket.complete_since_tid
 
     def close(self):
@@ -301,11 +302,12 @@ class _ObjectIndex(object):
         self.maps = [initial_bucket]
 
     def __repr__(self):
-        return '<%s at 0x%x maxhvt=%s minhvt=%s depth=%s>' % (
+        return '<%s at 0x%x maxhvt=%s minhvt=%s cst=%s depth=%s>' % (
             self.__class__.__name__,
             id(self),
             self.maximum_highest_visible_tid,
             self.minimum_highest_visible_tid,
+            self.complete_since_tid,
             len(self.maps),
         )
 
@@ -336,7 +338,7 @@ class _ObjectIndex(object):
                 assert mapping[oid] == tid, dict(mapping)
                 continue
 
-            debug("Storing", oid, "at", tid, "into", mapping, dict(mapping))
+            #debug("Storing", oid, "at", tid, "into", mapping, dict(mapping))
             assert mapping.complete_since_tid is None or tid <= mapping.complete_since_tid
             mapping[oid] = tid
             break
@@ -347,6 +349,9 @@ class _ObjectIndex(object):
     def highest_visible_tid(self):
         return self.maps[0].highest_visible_tid
 
+    # The maximum_highest_visible_tid of this object, and indeed, of any
+    # given map, must never change. It must always match what's
+    # visible to the clients it has been handed to.
     maximum_highest_visible_tid = highest_visible_tid
 
     @property
@@ -386,6 +391,7 @@ class _ObjectIndex(object):
             newest_map = mapping
 
     def with_polled_changes(self, highest_visible_tid, complete_since_tid, changes):
+
         # Never call this when the poller has specifically said
         # that there are no changes; either the very first poll, or
         # we went backwards due to reverting to a stale state. That's
@@ -406,12 +412,18 @@ class _ObjectIndex(object):
         if newest_bucket is oldest_bucket and oldest_bucket.complete_since_tid is None:
             # Merge the two together and replace ourself.
             assert highest_visible_tid >= oldest_bucket.highest_visible_tid
-            # Overwrite the incomplete data with the new data, which is complete
-            # back to a point. The make the incomplete data become the complete data
-            debug("Oldest bucket", oldest_bucket, "completing to", incoming_bucket)
-            oldest_bucket.complete_to(incoming_bucket)
-            debug("Oldest bucket is now", oldest_bucket)
-            return self
+            if highest_visible_tid == oldest_bucket.highest_visible_tid:
+                # Overwrite the incomplete data with the new data, which is complete
+                # back to a point. The make the incomplete data become the complete data
+                #debug("Oldest bucket", oldest_bucket, "completing to", incoming_bucket)
+                oldest_bucket.complete_to(incoming_bucket)
+                #debug("Oldest bucket is now", oldest_bucket)
+                return self
+            # We need to move forward. Therefore we need a new map.
+            incoming_bucket.merge_older_tid(oldest_bucket)
+            other = _ObjectIndex.__new__(_ObjectIndex)
+            other.maps = [incoming_bucket]
+            return other
 
         # Special cases:
         #
@@ -430,7 +442,7 @@ class _ObjectIndex(object):
         )
 
         if highest_visible_tid == newest_bucket.highest_visible_tid:
-            debug("Merging for same tid", newest_bucket, "incoming", incoming_bucket)
+            #debug("Merging for same tid", newest_bucket, "incoming", incoming_bucket)
             newest_bucket.merge_same_tid(incoming_bucket)
             return self
 
@@ -441,6 +453,13 @@ class _ObjectIndex(object):
         other.verify() # XXX: Remove before release.
         return other
 
+class _AlreadyClosedLock(object):
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, t, v, tb):
+        "Does nothing"
 
 @implementer(IStorageCacheMVCCDatabaseCoordinator)
 class MVCCDatabaseCoordinator(InvalidationMixin):
@@ -457,15 +476,17 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
     def __init__(self):
         # Use this lock when we're doing normal poll updates
         # or need to read consistent metadata.
-        self._da0_lock = threading.Lock()
+        self._da0_lock = threading.RLock()
         self.registered_viewers = []
 
     def register(self, cache):
-        self.registered_viewers.append(weakref.ref(cache, self.registered_viewers.remove))
+        with self._da0_lock:
+            self.registered_viewers.append(weakref.ref(cache, self.registered_viewers.remove))
 
     def unregister(self, cache):
-        if self.is_registered(cache):
-            self.registered_viewers.remove(weakref.ref(cache))
+        with self._da0_lock:
+            if self.is_registered(cache):
+                self.registered_viewers.remove(weakref.ref(cache))
 
     def is_registered(self, cache):
         return weakref.ref(cache) in self.registered_viewers
@@ -477,7 +498,19 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
 
     @property
     def minimum_highest_visible_tid(self):
-        return None if self.object_index is None else self.object_index.minimum_highest_visible_tid
+        # TODO: Track this in real time instead of computing.
+        min_tid = None
+        for cache_wref in self.registered_viewers:
+            cache = cache_wref()
+            if cache is None:
+                continue
+            if min_tid is None:
+                min_tid = cache.highest_visible_tid # Could still be None
+            cache_tid = cache.highest_visible_tid
+            if cache_tid is not None and min_tid is not None and cache_tid < min_tid:
+                min_tid = cache_tid
+
+        return min_tid
 
     @property
     def complete_since_tid(self):
@@ -488,28 +521,38 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
             'object_index': self.object_index,
         }
 
+    def reset_viewer(self, cache):
+        with self._da0_lock:
+            # Take the lock so that our MVCC state stays consistent.
+            cache.object_index = None
+
     def poll(self, cache, conn, cursor):
         # For now, we'll do it all while locked, ensuring a linear history
         with self._da0_lock:
             return self._poll_locked(cache, conn, cursor)
 
+    def __set_viewer_state_locked(self, cache):
+        cache.object_index = self.object_index
+        return self.object_index
+
     def _poll_locked(self, cache, conn, cursor):
         # Note that poll_invalidations can raise StaleConnectionError,
         # or it can return (None, old_tid) where old_tid is less than
         # its third parameter (``prev_polled_tid``)
-        debug("Entering poll")
+        #debug("Entering poll")
         if self.object_index is None:
-            debug("Initial poll for", cache)
+            #debug("Initial poll for", cache)
             # Initial poll for the world. Do this locked to be sure we
             # have a consistent state.
             change_iter, tid = cache.adapter.poller.poll_invalidations(conn, cursor, None, None)
             assert change_iter is None
             if tid > 0:
-                debug("Found data; can begin caching", cache, tid)
+                #debug("Found data; can begin caching", cache, tid)
                 # tid 0 is empty database, no data.
                 self.object_index = _ObjectIndex(tid)
-            debug("Initial got tid", tid, self.object_index)
-            return change_iter, tid or None, self.object_index or {}
+            #debug("Initial got tid", tid, self.object_index)
+            self.__set_viewer_state_locked(cache)
+            return change_iter
 
 
         # We've been here before. See comments in _ObjectIndex docstring about
@@ -521,26 +564,28 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
             None)
         if tid == 0 or tid < polling_since:
             assert change_iter is None
-            debug("Freshly zapped or empty db", tid, polling_since, change_iter)
+            #debug("Freshly zapped or empty db", tid, polling_since, change_iter)
             # Freshly zapped or empty database (tid==0)
             # or stale and asked to revert
             self.object_index = None
-            return change_iter, tid, {}
+            self.__set_viewer_state_locked(cache)
+            return change_iter
 
         # Ok cool, we got data to move us forward.
         # Let's do it.
         # Will need to be able to iterate this more than once.
         change_iter = list(change_iter)
-        debug("Changes since", polling_since, "now at", tid, "are", change_iter)
+        #debug("Changes since", polling_since, "now at", tid, "are", change_iter)
         prev_index = self.object_index
         ix_up = _ObjectIndex if prev_index is None else prev_index.with_polled_changes
         self.object_index = new_index = ix_up(tid, polling_since, change_iter)
 
         if len(new_index.maps) < 2:
-            debug("Nothing to freeze", new_index)
-            return change_iter, tid, new_index
+            #debug("Nothing to freeze", new_index)
+            self.__set_viewer_state_locked(cache)
+            return change_iter
 
-        prev_min_highest_visible_tid = prev_index.minimum_highest_visible_tid
+        prev_min_highest_visible_tid = self.minimum_highest_visible_tid
         # Should we move the minimum forward? Lets see, did we just update the minimum?
         move_forward = prev_min_highest_visible_tid == polling_since
         if move_forward:
@@ -548,37 +593,42 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
 
             for wref in self.registered_viewers:
                 viewer = wref()
-                if viewer is None or viewer is cache or not viewer.highest_visible_tid:
+                if viewer is None or viewer is cache or viewer.highest_visible_tid is None:
                     continue
+                __traceback_info__ = viewer, cache
                 assert viewer.highest_visible_tid >= polling_since, (viewer, polling_since)
-                if viewer == polling_since:
+                if viewer.highest_visible_tid == polling_since:
                     # Snarf. Someone else still looking at this.
                     move_forward = False
                     break
         if move_forward:
-            debug("Moving forward from", prev_min_highest_visible_tid, "to", tid)
+            #debug("Moving forward from", prev_min_highest_visible_tid, "to", tid)
             oldest_bucket = new_index.maps[-2]
             obsolete_bucket = new_index.maps.pop()
-            debug("Merging together", oldest_bucket, "with obsolete", obsolete_bucket)
-            debug("Oldest data", dict(oldest_bucket))
-            debug("Obsolete data", dict(obsolete_bucket))
+            #debug("Merging together", oldest_bucket, "with obsolete", obsolete_bucket)
+            #debug("Oldest data")
+            #debug("Obsolete data")
             oldest_bucket.merge_older_tid(obsolete_bucket)
-            debug("Did merge", oldest_bucket, dict(oldest_bucket))
+            #debug("Did merge", oldest_bucket)
             # XXX: TODO: Here is where we should freeze things.
             # Remove old TIDs from the map, and re-cache objects with the new key.
             obsolete_bucket.close()
-            debug("Closed", obsolete_bucket, dict(obsolete_bucket))
-            debug("Oldest still", oldest_bucket, dict(oldest_bucket))
+            #debug("Closed", obsolete_bucket)
+            #debug("Oldest still", oldest_bucket)
 
-        debug("After freeze; changes", change_iter, "new tid", tid, "index", new_index)
-        return change_iter, tid, new_index
+        #debug("After freeze; changes", change_iter, "new tid", tid, "index", new_index)
+        self.__set_viewer_state_locked(cache)
+        return change_iter
 
     def flush_all(self):
-        self.object_index = None
+        with self._da0_lock:
+            self.object_index = None
 
     def close(self):
-        self._da0_lock = None
-        self.object_index = None
+        with self._da0_lock:
+            self._da0_lock = _AlreadyClosedLock()
+            self.object_index = None
+            self.registered_viewers = ()
 
     def invalidate_all(self, oids):
         if not self.object_index:
@@ -598,29 +648,16 @@ class MVCCDatabaseCoordinator(InvalidationMixin):
         # file that we didn't get to actually store but that still
         # comes back in the delta_map; that's ok.
         row_filter = _PersistentRowFilter(adapter,
-                                          lambda: _TransactionRangeObjectIndex(1, None, ()))
+                                          OidTMap)
         local_client.restore(row_filter)
-        local_client.remove_invalid_persistent_oids(row_filter.polled_invalid_oids)
 
-        checkpoints = local_client.get_checkpoints()
-        if checkpoints and row_filter.delta_after0:
-            # No point keeping the delta maps otherwise,
-            # we have to poll. If there were no checkpoints, it means
-            # we saved without having ever completed a poll.
-            #
-            # We choose the cp0 as our beginning TID at which to
-            # resume polling. We have information on cached data as it
-            # relates to those checkpoints. (TODO: Are we sure that
-            # the delta maps we've just built are actually accurate
-            # as-of this particular TID we're choosing to poll from?)
-            #
-            # XXX: Now that we're tracking a tid globally we can do much better.
-            # XXX: This doesn't correspond to what we actually need anymore.
+        if row_filter.complete_range:
+            # We will thus begin polling at the last poll location
+            # stored in the data.
             self.object_index = _ObjectIndex(
-                row_filter.delta_after0.maxValue(),
-                None,
-                row_filter.delta_after0)
-            self.object_index.maps[0].update(row_filter.delta_after1)
+                row_filter.highest_visible_tid,
+                row_filter.complete_since_tid,
+                row_filter.complete_range)
         else:
             self.object_index = None
 
@@ -629,137 +666,98 @@ class _PersistentRowFilter(object):
 
     def __init__(self, adapter, delta_type):
         self.adapter = adapter
-        self.delta_after0 = delta_type()
-        self.delta_after1 = delta_type()
-        self.polled_invalid_oids = OidSet()
+        self.complete_range = delta_type()
+        self.highest_visible_tid = 0
+        self.complete_since_tid = 0
 
     def __str__(self):
         return "<PersistentRowFilter>"
 
     def __call__(self, checkpoints, row_iter):
+        # The 'checkpoints' are actually
+        # (max_highest_visible_tid, complete_since_tid)
+        # where complete_since_tid could actually be == max_hvt if
+        # we didn't have that information.
         if not checkpoints:
-            # Nothing to do except put in correct format, no transforms are possible.
-            # XXX: Is there really even any reason to return these? We'll probably
-            # never generate keys that match them.
-            for row in row_iter:
-                yield row[:2], row[2:]
-        else:
-            delta_after0 = self.delta_after0
-            delta_after1 = self.delta_after1
-            cp0, cp1 = checkpoints
+            #debug("No checkpoints")
+            checkpoints = (0, 0)
 
-            # {oid: (state, actual_tid)}
-            # This holds things that we're not sure about; we hold onto them
-            # and run a big query at the end to determine whether they're still valid or
-            # not.
-            needs_checked = OidOMap()
+        #debug("Using checkpoints", checkpoints)
+        complete_range = self.complete_range
+        highest_visible_tid, complete_since_tid = checkpoints
+        self.highest_visible_tid = highest_visible_tid
+        self.complete_since_tid = complete_since_tid
 
-            for row in row_iter:
-                # Rows are (oid, tid, state, tid), where the two tids
-                # are always equal.
-                key = row[:2]
-                value = row[2:]
-                oid = key[0]
-                actual_tid = value[1]
-                # See __poll_replace_checkpoints() to see how we build
-                # the delta maps.
-                #
-                # We'll poll for changes *after* cp0
-                # (because we set that as our current_tid/the
-                # storage's prev_polled_tid) and update
-                # self._delta_after0, but we won't poll for changes
-                # *after* cp1. self._delta_after1 is only ever
-                # populated when we shift checkpoints; we assume any
-                # changes that happen after that point we catch in an
-                # updated self._delta_after0.
-                #
-                # Also, because we're combining data in the local
-                # database from multiple sources, it's *possible* that
-                # some old cache had checkpoints that are behind what
-                # we're working with now. So we can't actually trust
-                # anything that we would put in delta_after1 without
-                # validating them. We still return it, but we may take
-                # it out of delta_after0 if it turns out to be
-                # invalid.
+        # Right now, we only keep things in the complete range.
+        # The 'frozen' data is still to come.
 
-                if actual_tid > cp0:
-                    delta_after0[oid] = actual_tid
-                elif actual_tid > cp1:
-                    delta_after1[oid] = actual_tid
-                else:
-                    # This is too old and outside our checkpoints for
-                    # when something changed. It could be good to have it,
-                    # it might be something that doesn't change much.
-                    # Unfortunately, we can't just stick it in our fallback
-                    # keys (oid, cp0) or (oid, cp1), because it might not be current,
-                    # and the storage won't poll this far back.
-                    #
-                    # The solution is to hold onto it and run a manual poll ourself;
-                    # if it's still valid, good. If not, someone should
-                    # remove it from the database so we don't keep checking.
-                    # We also should only do this poll if we have room in our cache
-                    # still (that should rarely be an issue; our db write size
-                    # matches our in-memory size except for the first startup after
-                    # a reduction in in-memory size.)
-                    needs_checked[oid] = value
-                    continue
-                yield key, value
+        for row in row_iter:
+            # Rows are (oid, tid, state, tid), where the two tids
+            # are always equal.
+            oid = row[0]
+            value = row[2:]
+            actual_tid = value[1]
 
-            # Now validate things that need validated.
+            if actual_tid <= highest_visible_tid and actual_tid >= complete_since_tid:
+                #debug('Restoring', oid, "at", actual_tid)
+                complete_range[oid] = actual_tid
+                yield (oid, actual_tid), value
 
-            # TODO: Should this be a configurable option, like ZEO's
-            # 'drop-rather-invalidate'? So far I haven't seen signs that
-            # this will be particularly slow or burdensome.
-            self._poll_delta_after1()
+        # Now validate things that need validated.
 
-            if needs_checked:
-                self._poll_old_oids_and_remove(needs_checked)
-                for oid, value in iteroiditems(needs_checked):
-                    # Anything left is guaranteed to still be at the tid we recorded
-                    # for it (except in the event of a concurrent transaction that
-                    # changed that object; that should be rare.) So these can go in
-                    # our fallback keys.
-                    yield (oid, cp0), value
+    #     # TODO: Should this be a configurable option, like ZEO's
+    #     # 'drop-rather-invalidate'? So far I haven't seen signs that
+    #     # this will be particularly slow or burdensome.
+    #     self._poll_delta_after1()
 
-    @log_timed
-    def _poll_old_oids_and_remove(self, to_check):
-        oids = list(to_check)
-        # In local tests, this function executes against PostgreSQL 11 in .78s
-        # for 133,002 older OIDs; or, .35s for 57,002 OIDs against MySQL 5.7.
-        logger.debug("Polling %d older oids stored in cache", len(oids))
-        def poll_old_oids_remove(_conn, cursor):
-            return self.adapter.mover.current_object_tids(cursor, oids)
-        current_tids_for_oids = self.adapter.connmanager.open_and_call(poll_old_oids_remove)
+    #     if needs_checked:
+    #         self._poll_old_oids_and_remove(needs_checked)
+    #         for oid, value in iteroiditems(needs_checked):
+    #             # Anything left is guaranteed to still be at the tid we recorded
+    #             # for it (except in the event of a concurrent transaction that
+    #             # changed that object; that should be rare.) So these can go in
+    #             # our fallback keys.
+    #             yield (oid, cp0), value
 
-        for oid in oids:
-            if (oid not in current_tids_for_oids
-                    or to_check[oid][1] != current_tids_for_oids[oid]):
-                del to_check[oid]
-                self.polled_invalid_oids.add(oid)
+    # @log_timed
+    # def _poll_old_oids_and_remove(self, to_check):
+    #     oids = list(to_check)
+    #     # In local tests, this function executes against PostgreSQL 11 in .78s
+    #     # for 133,002 older OIDs; or, .35s for 57,002 OIDs against MySQL 5.7.
+    #     logger.debug("Polling %d older oids stored in cache", len(oids))
+    #     def poll_old_oids_remove(_conn, cursor):
+    #         return self.adapter.mover.current_object_tids(cursor, oids)
+    #     current_tids_for_oids = self.adapter.connmanager.open_and_call(poll_old_oids_remove)
 
-        logger.debug("Polled %d older oids stored in cache; %d survived",
-                     len(oids), len(to_check))
+    #     for oid in oids:
+    #         if (oid not in current_tids_for_oids
+    #                 or to_check[oid][1] != current_tids_for_oids[oid]):
+    #             del to_check[oid]
+    #             self.polled_invalid_oids.add(oid)
 
-    @log_timed
-    def _poll_delta_after1(self):
-        orig_delta_after1 = self.delta_after1
-        oids = list(self.delta_after1)
-        # TODO: We have a defined transaction range here that we're concerned
-        # about. We might be better off using poller.list_changes(), just like
-        # __poll_replace_checkpoints() does.
-        logger.debug("Polling %d oids in delta_after1", len(oids))
-        def poll_oids_delta1(_conn, cursor):
-            return self.adapter.mover.current_object_tids(cursor, oids)
-        poll_oids_delta1.transaction_isolation_level = self.adapter.connmanager.isolation_load
-        poll_oids_delta1.transaction_read_only = True
-        current_tids_for_oids = self.adapter.connmanager.open_and_call(poll_oids_delta1)
-        self.delta_after1 = _TransactionRangeObjectIndex(1, None, ())
-        self.delta_after1.update(current_tids_for_oids)
-        invalid_oids = {
-            oid
-            for oid, tid in iteroiditems(orig_delta_after1)
-            if oid not in self.delta_after1 or self.delta_after1[oid] != tid
-        }
-        self.polled_invalid_oids.update(invalid_oids)
-        logger.debug("Polled %d oids in delta_after1; %d survived",
-                     len(oids), len(oids) - len(invalid_oids))
+    #     logger.debug("Polled %d older oids stored in cache; %d survived",
+    #                  len(oids), len(to_check))
+
+    # @log_timed
+    # def _poll_delta_after1(self):
+    #     orig_delta_after1 = self.delta_after1
+    #     oids = list(self.delta_after1)
+    #     # TODO: We have a defined transaction range here that we're concerned
+    #     # about. We might be better off using poller.list_changes(), just like
+    #     # __poll_replace_checkpoints() does.
+    #     logger.debug("Polling %d oids in delta_after1", len(oids))
+    #     def poll_oids_delta1(_conn, cursor):
+    #         return self.adapter.mover.current_object_tids(cursor, oids)
+    #     poll_oids_delta1.transaction_isolation_level = self.adapter.connmanager.isolation_load
+    #     poll_oids_delta1.transaction_read_only = True
+    #     current_tids_for_oids = self.adapter.connmanager.open_and_call(poll_oids_delta1)
+    #     self.delta_after1 = _TransactionRangeObjectIndex(1, None, ())
+    #     self.delta_after1.update(current_tids_for_oids)
+    #     invalid_oids = {
+    #         oid
+    #         for oid, tid in iteroiditems(orig_delta_after1)
+    #         if oid not in self.delta_after1 or self.delta_after1[oid] != tid
+    #     }
+    #     self.polled_invalid_oids.update(invalid_oids)
+    #     logger.debug("Polled %d oids in delta_after1; %d survived",
+    #                  len(oids), len(oids) - len(invalid_oids))
