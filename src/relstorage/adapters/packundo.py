@@ -196,9 +196,11 @@ class PackUndo(DatabaseHelpersMixin):
             upload_batch()
 
     # The only things to worry about are object_state and blob_chuck
-    # and, in history-preserving, current_object and transaction.
-    # blob chunks are deleted automatically by a foreign key; transaction we'll
-    # handle with a pack.
+    # and, in history-preserving, transaction. blob chunks are deleted
+    # automatically by a foreign key; transaction we'll handle with a
+    # pack. (We don't do anything with current_object; a state of NULL
+    # represents a deleted object; it shouldn't be reachable anyway
+    # and will be packed away next time we pack (without GC))
 
     # We shouldn't *have* to verify the oldserial in the delete statement,
     # because our only consumer is zc.zodbdgc which only calls us for
@@ -344,7 +346,7 @@ class HistoryPreservingPackUndo(PackUndo):
         # transaction to undo matches the object's current state. If
         # any object in the transaction does not fit that rule, refuse
         # to undo. In theory this means arbitrary transactions can be
-        # undone (because we actually match the state); in practice it
+        # undone (because we actually match the MD5 of the state); in practice it
         # means that it must be the most recent transaction those
         # objects were involved in.
 

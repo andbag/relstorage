@@ -191,7 +191,9 @@ class AbstractBegin(AbstractTPCState):
         it). In history preserving mode, it will wind up allocating a tid
         to store the empty transaction (only previous states were undone)
 
-        TODO: This needs a better, staged implementation.
+        TODO: This needs a better, staged implementation. I think it is
+           highly likely to deadlock now if anything happened to be reading
+           those rows.
         XXX: If we have blobs in a non-shared disk location, this does not
            remove them.
         """
@@ -258,6 +260,10 @@ class HistoryPreserving(AbstractBegin):
             self.committing_tid_lock = tid_lock
 
     def deleteObject(self, oid, oldserial, transaction):
+        # XXX: Maybe we don't need the commit lock at all? Since
+        # theoretically these are unreachable? Our custom
+        # vote stage just removes this transaction anyway; maybe it
+        # can skip the committing.
         self._obtain_commit_lock(self.store_connection.cursor)
         # A transaction that deletes objects can *only* delete objects.
         # That way we don't need to store an entry in the transaction table

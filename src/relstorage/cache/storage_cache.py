@@ -752,15 +752,7 @@ class _TemporaryStorage(object):
         """
         Return the bytes for a previously stored temporary item.
         """
-        try:
-            startpos, endpos, _ = self._queue_contents[oid_int]
-        except KeyError:
-            # XXX: Seeing this on appveyor, only in a few tests,
-            # only on MySQL. Not sure why.
-            raise KeyError("No oid %d stored in %s" % (
-                oid_int,
-                list(self._queue_contents)
-            ))
+        startpos, endpos, _ = self._queue_contents[oid_int]
         return self._read_temp_state(startpos, endpos)
 
     def __iter__(self):
