@@ -58,13 +58,6 @@ class _UsedAfterRelease(object):
     new_instance = lambda s: s
 _UsedAfterRelease = _UsedAfterRelease()
 
-def _debug(*_args):
-    "Does nothing"
-if 0: # pylint:disable=using-constant-test
-    debug = print
-else:
-    debug = _debug
-
 
 @interface.implementer(IStorageCache, IPersistentCache)
 class StorageCache(object):
@@ -179,11 +172,27 @@ class StorageCache(object):
         and having the most current view of the database as collected
         by any instance.
 
-        If *before* is given, XXX: Precisely what? Freezing and such won't
-        work well.
+        If *before* is given, the new cache will use a distinct
+        :class:`MVCCDatabaseCoordinator`  so that
+        its usage pattern does not interfere.
         """
         cache = type(self)(self.adapter, self.options, self.prefix,
                            _parent=self)
+        if before:
+            cache.tpc_begin = lambda: None
+            def poll(conn, cursor, _):
+                # Grab whatever index we have the first time we poll,
+                # and then immediately drop away from the polling state.
+                # We don't want our increasingly-stale view of the database
+                # (which isn't even really quite accurate in terms of what we
+                # need: TODO: Should we do that?) to hold up vacuums (even
+                # though it will hold up vacuum in the real RDBMS).
+                cache.polling_state.poll(cache, conn, cursor)
+                # We'll never try to poll again, so this is ok.
+                cache.polling_state.unregister(cache)
+                del cache.poll
+                return ()
+            cache.poll = poll
         return cache
 
     def release(self):
@@ -392,8 +401,6 @@ class StorageCache(object):
         # If we've polled, but we're being asked for data from the future,
         # we can't answer.
         if not self.highest_visible_tid or tid_int > self.highest_visible_tid:
-            #debug("Not loadSerial; my hvt:", self.highest_visible_tid,
-            #      "Requested tid", tid_int)
             return None
 
         if not self.options.keep_history:
@@ -408,7 +415,6 @@ class StorageCache(object):
                 known_tid_int = self.polling_state.object_index[oid_int]
             if known_tid_int is not None and known_tid_int != tid_int:
                 return None
-            #debug("Known tid for oid", oid_int, "is", known_tid_int, "need", tid_int)
 
         # If we've seen this object, it could be in a few places:
         # (oid, tid) (if it was ever in a delta), or (oid, cp0)
@@ -438,7 +444,6 @@ class StorageCache(object):
             # No poll has occurred yet. For safety, don't use the cache.
             # Note that without going through the cache, we can't
             # go through tracing either.
-            #debug("No index, db for", oid_int)
             return self.adapter.mover.load_current(cursor, oid_int)
 
         # Get the object from the transaction specified
@@ -466,7 +471,6 @@ class StorageCache(object):
         # same key twice.
         cache = self.cache
         tid_int = self.object_index[oid_int]
-        #debug("Index for", oid_int, "is", tid_int)
         if tid_int:
             # This object changed after checkpoint0, so
             # there is only one place to look for its state: the exact key.
@@ -474,12 +478,10 @@ class StorageCache(object):
             cache_data = cache[key]
             if cache_data:
                 # Cache hit.
-                #debug("Cache hit for", oid_int, "at", tid_int, self.object_index)
                 assert cache_data[1] == tid_int, (cache_data[1], key)
                 return cache_data
 
             # Cache miss.
-            #debug("Cache miss for", oid_int, "at", tid_int)
             state, actual_tid_int = self.adapter.mover.load_current(
                 cursor, oid_int)
             if state and actual_tid_int:
@@ -502,7 +504,6 @@ class StorageCache(object):
             cache_data = None
 
         if cache_data:
-            #debug("Found frozen", oid_int)
             assert cache_data[1] <= self.highest_visible_tid, (cache_data[1], key)
             return cache_data
 
@@ -515,9 +516,7 @@ class StorageCache(object):
                 key = (oid_int, -1)
             else:
                 key = (oid_int, tid_int)
-                #debug("Indexing after misses", key, "global CST?", complete_since)
                 self.object_index[oid_int] = tid_int
-            #debug("Caching after misses", key, "global CST?", complete_since)
             cache[key] = (state, tid_int)
 
         return state, tid_int

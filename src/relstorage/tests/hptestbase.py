@@ -270,7 +270,7 @@ class HistoryPreservingRelStorageTests(GenericRelStorageTests,
         root['first']['count'] += 1
         transaction.commit()
 
-        transaction1 = transaction.TransactionManager()
+        transaction1 = transaction.TransactionManager(explicit=True)
 
         historical_conn = db.open(transaction_manager=transaction1, at=time_of_first_transaction)
 
@@ -282,7 +282,7 @@ class HistoryPreservingRelStorageTests(GenericRelStorageTests,
         eq(conn.root()['first']['count'], 1)
 
         # historical connection sees past:
-
+        transaction1.begin()
         eq(sorted(historical_conn.root().keys()), ['first'])
         eq(historical_conn.root()['first']['count'], 0)
 
@@ -294,6 +294,20 @@ class HistoryPreservingRelStorageTests(GenericRelStorageTests,
                           transaction1.commit)
         transaction1.abort()
         eq(historical_conn.root()['first']['count'], 0)
+
+        # Making a change in the present
+        root['third'] = 3
+        transaction.commit()
+
+        # Is also not reflected in the past, even after explicit sync,
+        transaction1.begin()
+        eq(sorted(historical_conn.root().keys()), ['first'])
+        eq(historical_conn.root()['first']['count'], 0)
+        # Since we cannot change anything, we cannot join a transaction either.
+        # The afterCompletion call is never invoked.
+        historical_conn._storage._storage.afterCompletion = lambda: self.fail("Not called")
+        transaction1.commit()
+
 
         historical_conn.close()
         conn.close()
