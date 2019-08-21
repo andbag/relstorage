@@ -230,8 +230,8 @@ class HistoryPreservingRelStorageTests(GenericRelStorageTests,
             c1 = db.open()
             r1 = c1.root()
             r1['A'] = PersistentMapping()
-            B = PersistentMapping()
-            r1['A']['B'] = B
+            A_B = PersistentMapping()
+            r1['A']['B'] = A_B
             transaction.get().note(u'add A then add B to A')
             transaction.commit()
 
@@ -240,14 +240,16 @@ class HistoryPreservingRelStorageTests(GenericRelStorageTests,
             transaction.commit()
 
             r1['A']['C'] = ''
-            transaction.get().note(u'add C to A')
+            transaction.get().note(u'add C (non-persistent) to A')
             transaction.commit()
 
             packtime = c1._storage.lastTransactionInt()
             self._storage.pack(packtime, referencesf)
 
             # B should be gone, since nothing refers to it.
-            self.assertRaises(KeyError, self._storage.load, B._p_oid, '')
+            with self.assertRaises(KeyError):
+                __traceback_info__ = bytes8_to_int64(A_B._p_oid)
+                self._storage.load(A_B._p_oid)
 
         finally:
             db.close()

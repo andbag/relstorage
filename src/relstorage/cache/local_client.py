@@ -280,6 +280,12 @@ class LocalClient(object):
             del self.__bucket[oid_tid]
             if oid_tid[1] > self._min_allowed_writeback.get(oid_tid[0], MAX_TID):
                 self._min_allowed_writeback[oid_tid[0]] = oid_tid[1]
+            # If there's frozen data that matches, it must also go
+            frozen_key = (oid_tid[0], -1)
+            frozen_data = self.__bucket.get_from_key_or_backup_key(frozen_key, None)
+            if frozen_data and frozen_data[1] <= oid_tid[1]:
+                del self.__bucket[frozen_key]
+
 
     def invalidate_all(self, oids):
         with self._lock:
@@ -287,6 +293,25 @@ class LocalClient(object):
             for oid, tid in self.__bucket.invalidate_all(oids):
                 if tid > min_allowed.get(oid, MAX_TID):
                     min_allowed[oid] = tid
+
+    def freeze(self, oids_tids):
+        """
+        This is a horrible inefficient implementation.
+        """
+        # The idea is to *move* the data, or make it available,
+        # *without* copying it. This copies. Slowly.
+        # IDEA: Custom length function, store: {oid: [(oid, tid), ...]}
+        with self._lock:
+            get = self.__bucket.get_from_key_or_backup_key
+            for oid_tid in oids_tids.items():
+                data = get(oid_tid, None)
+                if data:
+                    frozen_key = (oid_tid[0], -1)
+                    frozen_data = get(frozen_key, None) or (data, -2)
+                    if frozen_data:
+                        assert frozen_data[1] <= data[1]
+                        if frozen_data[1] < data[1]:
+                            self.__bucket[frozen_key] = data
 
     def store_checkpoints(self, cp0, cp1):
         # No lock, the assignment should be atomic

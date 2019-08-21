@@ -68,6 +68,12 @@ class IStorageCacheMVCCDatabaseCoordinator(IMVCCDatabaseCoordinator):
 
     # TODO: Fill me in.
 
+    def after_tpc_finish(viewer):
+        """
+        Let the coordinator know that the registered *viewer* is
+        between transactions and can release its last snapshot.
+        """
+
     def stats():
         """
         Return a dictionary with interesting keys and values

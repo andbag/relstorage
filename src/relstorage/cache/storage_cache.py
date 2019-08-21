@@ -496,6 +496,11 @@ class StorageCache(object):
         # but only locally.
         key = (oid_int, -1)
         cache_data = self.local_client[key]
+        if cache_data and tid_int and cache_data[1] != tid_int:
+            # Someone else has frozen the data in the future, we shouldn't see or
+            # use it.
+            cache_data = None
+
         if cache_data:
             #debug("Found frozen", oid_int)
             assert cache_data[1] <= self.highest_visible_tid, (cache_data[1], key)
@@ -510,8 +515,9 @@ class StorageCache(object):
                 key = (oid_int, -1)
             else:
                 key = (oid_int, tid_int)
+                #debug("Indexing after misses", key, "global CST?", complete_since)
                 self.object_index[oid_int] = tid_int
-            #debug("Storing after misses", key)
+            #debug("Caching after misses", key, "global CST?", complete_since)
             cache[key] = (state, tid_int)
 
         return state, tid_int
@@ -600,8 +606,9 @@ class StorageCache(object):
         # Simple, next time we poll, we include polling for this
         # transaction; that way *everyone* can benefit.
         self.cache.set_all_for_tid(tid_int, self.temp_objects)
-
         self.clear_temp()
+        # Let it know ASAP that we're between transactions.
+        self.polling_state.after_tpc_finish(self)
 
     def clear_temp(self):
         """Discard all transaction-specific temporary data.

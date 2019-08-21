@@ -93,6 +93,7 @@ class _ClosedCache(object):
     release = close
     object_index = ()
     highest_visible_tid = None
+    stats = lambda s: {'closed': True}
 
 @implementer(IRelStorage)
 class RelStorage(LegacyMethodsMixin,
