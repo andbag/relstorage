@@ -54,6 +54,8 @@ class TestCase(unittest.TestCase):
         None
     ) or _fakeSubTest
 
+    none = unittest.TestCase.assertIsNone
+
     def setUp(self):
         super(TestCase, self).setUp()
         # This is done by ZODB.tests.util.TestCase, but

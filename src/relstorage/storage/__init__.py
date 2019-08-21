@@ -81,7 +81,7 @@ __all__ = [
     'RelStorage',
 ]
 
-log = logging.getLogger("relstorage")
+log = logger = logging.getLogger("relstorage")
 
 
 class _ClosedCache(object):
@@ -358,6 +358,8 @@ class RelStorage(LegacyMethodsMixin,
         self._oids = None
         self._load_connection = ClosedConnection()
         self._store_connection = ClosedConnection()
+        if not self._instances:
+            self._closed = True
 
     def close(self):
         """Close the storage and all instances."""
@@ -376,7 +378,7 @@ class RelStorage(LegacyMethodsMixin,
             if instance is not None:
                 instance.close()
         self._instances = ()
-
+        logger.debug("Closing storage cache with stats %s", self._cache.stats())
         self._cache.close()
         self._cache = _ClosedCache()
 

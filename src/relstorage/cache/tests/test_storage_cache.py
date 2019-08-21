@@ -102,7 +102,6 @@ class StorageCacheTests(TestCase):
         import shutil
 
         c = self._makeOne()
-        c.local_client.store_checkpoints(268595726030645777, 0)
         c.tpc_begin()
         # tid is 2016-09-29 11:35:58,120
         # (That used to matter when we stored that information as a
@@ -110,6 +109,7 @@ class StorageCacheTests(TestCase):
         tid = 268595726030645777
         oid = 2
         c.store_temp(oid, b'abc')
+        # Flush to the cache.
         c.after_tpc_finish(p64(tid))
 
         key = list(iter(c.local_client))[0]
@@ -117,6 +117,13 @@ class StorageCacheTests(TestCase):
 
         c.options.cache_local_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, c.options.cache_local_dir, True)
+
+        # Make like we polled.
+        from relstorage.cache import mvcc
+        ix = mvcc._ObjectIndex(tid - 1)
+        ix = ix.with_polled_changes(tid, tid - 1, [(oid, tid)])
+        c.polling_state.object_index = ix
+        c.object_index = ix
 
         return c, oid, tid
 

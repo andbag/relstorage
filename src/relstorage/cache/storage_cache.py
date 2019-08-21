@@ -95,7 +95,7 @@ class StorageCache(object):
             # This is shared between all instances of a cache in a tree,
             # including the master, so that they can share information about
             # polling.
-            self.polling_state = MVCCDatabaseCoordinator()
+            self.polling_state = MVCCDatabaseCoordinator(self.options)
             self.polling_state.register(self)
             self.local_client = LocalClient(options, self.prefix)
 
@@ -155,7 +155,10 @@ class StorageCache(object):
         Return stats. This is a debugging aid only. The format is undefined and intended
         for human inspection only.
         """
-        return self.local_client.stats()
+        stats = self.local_client.stats()
+        stats['local_index_stats'] = self.object_index.stats() if self.object_index else None
+        stats['global_index_stats'] = self.polling_state.stats()
+        return stats
 
     def __repr__(self):
         return "<%s at 0x%x hvt=%s bytes=%d len=%d state=%r>" % (
@@ -214,6 +217,9 @@ class StorageCache(object):
         cache = self.cache
         polling_state = self.polling_state
 
+        # Go ahead and release our polling_state now, in case
+        # it helps to vacuum for save.
+        self.polling_state.unregister(self)
         self.save(**save_args)
         self.release()
         cache.close()
@@ -236,12 +242,7 @@ class StorageCache(object):
                 # This is the authoritative location. We don't try as hard to
                 # store into the caches anymore.
                 # TODO: Work on the coupling here.
-                max_hvt = self.polling_state.maximum_highest_visible_tid
-                if max_hvt:
-                    self.local_client.store_checkpoints(
-                        max_hvt,
-                        self.polling_state.complete_since_tid or max_hvt)
-                return self.local_client.save(**save_args)
+                return self.polling_state.save(self.local_client, save_args)
             logger.debug("Cannot justify writing cache file, no hits or misses")
 
     def restore(self):
@@ -593,92 +594,12 @@ class StorageCache(object):
         """
         tid_int = u64(tid)
 
-        # In particular, it stores the data in delta_after0 so that
-        # future cache lookups for oid_int should now use the tid just
-        # committed. We're about to flush that data to the cache.
-
-        # We can get here without having ever polled, so no
-        # checkpoints and no current_tid. So long as we're careful,
-        # that's not a problem. Being careful means being sure to
-        # keep the state of the previous polled TID matching, and avoiding
-        # unnecessary polls
-
-        # Under what circumstances would we get here (after committing
-        # a transaction) without ever having polled to establish
-        # checkpoints? Mostly this happens in test cases that directly
-        # use storage APIs, but it also turns out that database-level
-        # APIs like db.undo() use new storage instances in an unusual
-        # way, and will not necessarily have polled by the time they
-        # commit.
-        #
-        # Of course, if we restored from persistent cache files the master
-        # could have checkpoints we copied down.
-        #
-        # TODO: Create a special subclass for MVCC instances and separate
-        # the state handling.
-        #debug("After_tpc_finish", list(self.temp_objects.stored_oids))
+        # We DO NOT store anything into our object_index: That's only
+        # updated on a poll (if we tried, it would get thrown away as being
+        # too new anyway). So how do we get cache hits on these again in the future?
+        # Simple, next time we poll, we include polling for this
+        # transaction; that way *everyone* can benefit.
         self.cache.set_all_for_tid(tid_int, self.temp_objects)
-
-        # If we aren't keeping history, then a previous revision of
-        # the object we happened to know about is now gone. We can
-        # pre-emptively throw that away to try to save cache room. Of
-        # course, if some in-progress transaction that's behind us
-        # (still has an older view of the database) happens to want to
-        # load that object, it'll go back in the cache. c'est la vie.
-        # (XXX: Why not do this for history preserving too? It seems
-        # like historical connections are probably rarely used? since
-        # we have a special adapter for them we could do custom logic
-        # if any of those are around.)
-        #
-        # This might seem to result in a violation of our internal
-        # constraints: even though we haven't done a poll yet, we've
-        # modified our knowledge of canonical information in
-        # delta_after0. But we've always done that, and that's because
-        # polling specifically excludes the transaction that we just
-        # committed.
-        #
-        # This has the unfortunate side-effect of causing our
-        # optimized loadSerial() method to become useless for conflict
-        # resolution, however (unless the conflict happens in the same
-        # process). See ``checkResolveConflictBetweenConnections()``
-        #
-        # TODO: Continue enhancing the smarts for this. Maybe move to
-        # __poll_update_delta0_from_changes? Maybe make the polling
-        # state responsible? It could track invalidations and current
-        # tids across all connections and only throw away data when
-        # everyone has moved on thus solving the side-effect for
-        # loadSerial --- of course, that makes having an accurately
-        # sized connection pool and/or timeout important, or at least
-        # knowing when a connection is sitting idle and not being
-        # used. ``after_tpc_finish`` isn't enough for that, we need a
-        # hook from the storage.
-
-
-        # store = self.delta_after0.__setitem__
-        # if not self.keep_history:
-        #     pop0 = self.delta_after0.pop
-        #     pop1 = self.delta_after1.pop
-        #     # Note that we don't call self.invalidate(). We don't need
-        #     # most of its services; many are redundant with what we're about
-        #     # to do.
-        #     invalidate = self.cache.__delitem__
-        #     for oid_int in self.temp_objects.stored_oids:
-        #         old_tid = pop0(oid_int, None)
-        #         if old_tid:
-        #             invalidate((oid_int, old_tid))
-        #         old_tid = pop1(oid_int, None)
-        #         if old_tid:
-        #             invalidate((oid_int, old_tid))
-
-        #         store(oid_int, tid_int)
-        # else:
-        #     for oid_int in self.temp_objects.stored_oids:
-        #         # Future cache lookups for oid_int should now use
-        #         # the tid just committed. We're about to flush that
-        #         # data to the cache.
-        #         store(oid_int, tid_int)
-
-        # self.polling_state.after_tpc_finish(tid_int, self.temp_objects.stored_oids)
 
         self.clear_temp()
 

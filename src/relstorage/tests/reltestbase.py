@@ -1292,16 +1292,20 @@ class GenericRelStorageTests(
 
         transaction.commit()
 
-        if self.keep_history:
-            item_count = 3
-        else:
-            # The new state for the root invalidated the old state,
-            # but we keep the old state available for loadSerial,
-            # at least as long as connections might be using it.
-            # XXX: This changes as we change the cache strategy.
-            item_count = 3
+        item_count = 3
+
+        # The new state for the root invalidated the old state,
+        # and since there is no other connection that might be using it,
+        # we drop it from the cache.
+        item_count = 2
         self.assertEqual(item_count, len(self._storage._cache))
+        tid = bytes8_to_int64(mapping._p_serial)
+        keys = list(self._storage._cache.local_client._bucket0.keys())
+        for k in keys:
+            self.assertEqual(k[1], tid)
+            self.assertIn(k[0], (0, 1))
         self._storage._cache.clear()
+
         self.assertEmpty(self._storage._cache)
 
         conn.prefetch(z64, mapping)
